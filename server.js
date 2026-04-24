@@ -18,28 +18,68 @@ app.use(express.json());
 const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Extract JSON from Claude's response even if it's wrapped in markdown code blocks
+function extractJson(text) {
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  return JSON.parse(match ? match[1].trim() : text.trim());
+}
+
+// Normalize Claude's weeklyStructure format → frontend's days format
+function normalizePlan(planData) {
+  const source = planData.weeklyStructure ?? planData.days ?? [];
+  const days = source.map(d => ({
+    isRest: d.isRestDay ?? d.isRest ?? false,
+    focus: d.focus ?? '',
+    exercises: (d.exercises ?? []).map(ex => ({
+      name: ex.name,
+      sets: ex.sets,
+      reps: String(ex.reps),
+      rest: ex.restSeconds ? `${ex.restSeconds}s` : (ex.rest ?? ''),
+      notes: ex.notes ?? '',
+    })),
+  }));
+  return { days };
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
 app.post('/generate-workout-plan', async (req, res) => {
   try {
-    const { userId, goal, experience, equipment, daysPerWeek, injuries } = req.body;
+    const {
+      userId,
+      goal,
+      experience,
+      equipment,
+      injuries,
+      // accept both naming conventions from the frontend profile spread
+      daysPerWeek,
+      training_days,
+    } = req.body;
 
-    if (!userId || !goal || !experience || !equipment || !daysPerWeek) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    const days = daysPerWeek ?? training_days;
+
+    if (!userId || !goal || !experience || !equipment || !days) {
+      return res.status(400).json({
+        message: 'Missing required fields: userId, goal, experience, equipment, training_days',
+      });
     }
 
-    const prompt = `You are an expert fitness coach. Generate a ${daysPerWeek}-day per week workout plan for an Indian gym goer.
+    const prompt = `You are an expert fitness coach. Generate a ${days}-day per week workout plan for a gym goer.
 
 User Profile:
 - Goal: ${goal}
 - Experience: ${experience}
 - Equipment: ${equipment}
-- Days per week: ${daysPerWeek}
+- Days per week: ${days}
 - Injuries/limitations: ${injuries || 'None'}
 
-Return ONLY a valid JSON object in this exact format, no extra text:
+Return ONLY a valid JSON object — no markdown, no extra text — in this exact format:
 {
   "planName": "string",
   "weeklyStructure": [
@@ -63,40 +103,45 @@ Return ONLY a valid JSON object in this exact format, no extra text:
 }
 
 Rules:
-- Rest days should have empty exercises array and isRestDay true
+- weeklyStructure must have exactly 7 entries (one per day of the week)
+- Rest days must have isRestDay: true and an empty exercises array
+- Non-training days beyond the ${days} days/week must be rest days
 - Reps can be a range like "8-10" or a number like "12"
-- Include warm up and cool down as exercises where needed
-- Match exercises to available equipment: ${equipment}
-- Total days in weeklyStructure must be exactly 7`;
+- Match exercises strictly to available equipment: ${equipment}`;
 
     const message = await anthropic.messages.create({
-      model: 'claude-opus-4-5',
+      model: 'claude-sonnet-4-6',
       max_tokens: 4000,
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const responseText = message.content[0].text;
-    const planData = JSON.parse(responseText);
+    const planData = extractJson(message.content[0].text);
+    const normalized = normalizePlan(planData);
 
-    const { data: savedPlan, error } = await supabase
+    // Deactivate any existing active plans for this user
+    await supabase
+      .from('workout_plans')
+      .update({ is_active: false })
+      .eq('user_id', userId)
+      .eq('is_active', true);
+
+    const { error: insertError } = await supabase
       .from('workout_plans')
       .insert({
         user_id: userId,
         goal,
-        days_per_week: daysPerWeek,
+        days_per_week: days,
         plan_data: planData,
         is_active: true,
-      })
-      .select()
-      .single();
+      });
 
-    if (error) throw error;
+    if (insertError) throw insertError;
 
-    res.json({ success: true, plan: savedPlan });
+    res.json(normalized);
 
-  } catch (error) {
-    console.error('Generate workout plan error:', error);
-    res.status(500).json({ error: 'Failed to generate workout plan' });
+  } catch (err) {
+    console.error('Generate workout plan error:', err);
+    res.status(500).json({ message: err.message || 'Failed to generate workout plan' });
   }
 });
 
@@ -113,13 +158,17 @@ app.get('/workout-plan/:userId', async (req, res) => {
       .limit(1)
       .single();
 
-    if (error && error.code !== 'PGRST116') throw error;
+    if (error) {
+      // PGRST116 = no rows found
+      if (error.code === 'PGRST116') return res.status(404).json({ message: 'No active plan' });
+      throw error;
+    }
 
-    res.json({ success: true, plan: data || null });
+    res.json(normalizePlan(data.plan_data));
 
-  } catch (error) {
-    console.error('Get workout plan error:', error);
-    res.status(500).json({ error: 'Failed to fetch workout plan' });
+  } catch (err) {
+    console.error('Get workout plan error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch workout plan' });
   }
 });
 
