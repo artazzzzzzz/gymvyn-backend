@@ -359,6 +359,221 @@ app.get('/progress-photos/:userId', async (req, res) => {
   }
 });
 
+app.post('/chat', async (req, res) => {
+  try {
+    const { message, history = [], userProfile = {} } = req.body;
+
+    const systemPrompt = `You are FitForge AI, an expert fitness coach and nutritionist specializing in Indian gym culture. Help users with workouts, diet, form tips, supplements, and motivation. Keep responses concise and practical. Consider Indian food preferences for diet advice. Never give medical advice.\n\nUser Profile:\n${JSON.stringify(userProfile, null, 2)}`;
+
+    const contents = [
+      ...history.map(({ role, content }) => ({
+        role: role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: content }],
+      })),
+      { role: 'user', parts: [{ text: message }] },
+    ];
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents,
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const reply = data.candidates[0].content.parts[0].text;
+
+    res.json({ reply });
+  } catch (err) {
+    console.error('Chat error:', err);
+    res.status(500).json({ message: err.message || 'Failed to get chat response' });
+  }
+});
+
+// ── Community routes ──────────────────────────────────────────────────────────
+
+app.get('/posts', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('posts')
+      .select(`
+        *,
+        users ( username, avatar_url )
+      `)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('GET /posts error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch posts' });
+  }
+});
+
+app.post('/posts', async (req, res) => {
+  try {
+    const { user_id, content, image_url, post_type } = req.body;
+
+    if (!user_id || !content) {
+      return res.status(400).json({ message: 'Missing required fields: user_id, content' });
+    }
+
+    const { data, error } = await supabase
+      .from('posts')
+      .insert({ user_id, content, image_url, post_type })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    console.error('POST /posts error:', err);
+    res.status(500).json({ message: err.message || 'Failed to create post' });
+  }
+});
+
+app.post('/posts/:postId/like', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { user_id } = req.body;
+
+    if (!user_id) return res.status(400).json({ message: 'Missing required field: user_id' });
+
+    const { data: existing } = await supabase
+      .from('post_likes')
+      .select('id')
+      .eq('post_id', postId)
+      .eq('user_id', user_id)
+      .maybeSingle();
+
+    let liked;
+    if (existing) {
+      await supabase.from('post_likes').delete().eq('id', existing.id);
+      liked = false;
+    } else {
+      await supabase.from('post_likes').insert({ post_id: postId, user_id });
+      liked = true;
+    }
+
+    const { count } = await supabase
+      .from('post_likes')
+      .select('*', { count: 'exact', head: true })
+      .eq('post_id', postId);
+
+    await supabase.from('posts').update({ likes_count: count }).eq('id', postId);
+
+    res.json({ liked, likes_count: count });
+  } catch (err) {
+    console.error('POST /posts/:postId/like error:', err);
+    res.status(500).json({ message: err.message || 'Failed to toggle like' });
+  }
+});
+
+app.post('/posts/:postId/comments', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { user_id, content } = req.body;
+
+    if (!user_id || !content) {
+      return res.status(400).json({ message: 'Missing required fields: user_id, content' });
+    }
+
+    const { data: comment, error: commentError } = await supabase
+      .from('post_comments')
+      .insert({ post_id: postId, user_id, content })
+      .select()
+      .single();
+
+    if (commentError) throw commentError;
+
+    const { count } = await supabase
+      .from('post_comments')
+      .select('*', { count: 'exact', head: true })
+      .eq('post_id', postId);
+
+    await supabase.from('posts').update({ comments_count: count }).eq('id', postId);
+
+    res.status(201).json(comment);
+  } catch (err) {
+    console.error('POST /posts/:postId/comments error:', err);
+    res.status(500).json({ message: err.message || 'Failed to add comment' });
+  }
+});
+
+app.get('/posts/:postId/comments', async (req, res) => {
+  try {
+    const { postId } = req.params;
+
+    const { data, error } = await supabase
+      .from('post_comments')
+      .select(`
+        *,
+        users ( username, avatar_url )
+      `)
+      .eq('post_id', postId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('GET /posts/:postId/comments error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch comments' });
+  }
+});
+
+app.get('/leaderboard', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, username, avatar_url, streak')
+      .order('streak', { ascending: false })
+      .limit(10);
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('GET /leaderboard error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch leaderboard' });
+  }
+});
+
+app.get('/buddy-suggestions/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data: existingRequests } = await supabase
+      .from('buddy_requests')
+      .select('sender_id, receiver_id')
+      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
+
+    const excludedIds = new Set([userId]);
+    (existingRequests || []).forEach(r => {
+      excludedIds.add(r.sender_id);
+      excludedIds.add(r.receiver_id);
+    });
+
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, username, avatar_url, fitness_goal')
+      .not('id', 'in', `(${[...excludedIds].join(',')})`)
+      .limit(20);
+
+    if (error) throw error;
+
+    const shuffled = (data || []).sort(() => Math.random() - 0.5).slice(0, 5);
+    res.json(shuffled);
+  } catch (err) {
+    console.error('GET /buddy-suggestions/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch buddy suggestions' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
 });
