@@ -574,6 +574,85 @@ app.get('/buddy-suggestions/:userId', async (req, res) => {
   }
 });
 
+// ── Gym owner routes ──────────────────────────────────────────────────────────
+
+app.post('/api/gyms', async (req, res) => {
+  try {
+    const { userId, gymName, address, city, state, pincode, phone, email } = req.body;
+
+    if (!userId)                       return res.status(400).json({ message: 'Missing required field: userId' });
+    if (!gymName || !gymName.trim())   return res.status(400).json({ message: 'Gym name is required' });
+    if (!city || !city.trim())         return res.status(400).json({ message: 'City is required' });
+    if (!phone || !phone.trim())       return res.status(400).json({ message: 'Phone number is required' });
+    if (!/^\d{10}$/.test(phone.trim())) return res.status(400).json({ message: 'Phone must be 10 digits' });
+    if (pincode && !/^\d{6}$/.test(pincode.trim())) return res.status(400).json({ message: 'Pincode must be 6 digits' });
+    if (email && !/^\S+@\S+\.\S+$/.test(email.trim())) return res.status(400).json({ message: 'Email is not valid' });
+
+    // Check if user is already a gym owner
+    const { data: existingUser, error: userFetchError } = await supabase
+      .from('users')
+      .select('role, gym_id')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (userFetchError) throw userFetchError;
+    if (existingUser?.role === 'gym_owner' || existingUser?.gym_id) {
+      return res.status(409).json({ message: 'User is already associated with a gym' });
+    }
+
+    // Insert gym
+    const { data: gym, error: gymError } = await supabase
+      .from('gyms')
+      .insert({
+        owner_id: userId,
+        name: gymName.trim(),
+        address: address?.trim() || null,
+        city: city.trim(),
+        state: state?.trim() || null,
+        pincode: pincode?.trim() || null,
+        phone: phone.trim(),
+        email: email?.trim() || null,
+      })
+      .select()
+      .single();
+
+    if (gymError) throw gymError;
+
+    // Promote user to gym_owner; if it fails, roll back the gym insert
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ role: 'gym_owner', gym_id: gym.id })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Promoting user to gym_owner failed, rolling back gym:', updateError);
+      await supabase.from('gyms').delete().eq('id', gym.id);
+      throw updateError;
+    }
+
+    res.status(201).json({ gym, joinCode: gym.join_code });
+  } catch (err) {
+    console.error('POST /api/gyms error:', err);
+    res.status(500).json({ message: err.message || 'Failed to create gym' });
+  }
+});
+
+app.get('/api/gyms/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('gyms')
+      .select('*')
+      .eq('owner_id', userId)
+      .maybeSingle();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/gyms/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch gym' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
 });
