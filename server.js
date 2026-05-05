@@ -593,20 +593,18 @@ app.post('/api/gyms', async (req, res) => {
     }
 
     // Insert gym
-    const { data: gym, error: gymError } = await supabase
-      .from('gyms')
-      .insert({
-        owner_id: userId,
-        name: gymName.trim(),
-        address: address?.trim() || null,
-        city: city.trim(),
-        state: state?.trim() || null,
-        pincode: pincode?.trim() || null,
-        phone: phone.trim(),
-        email: email?.trim() || null,
-      })
-      .select()
-      .single();
+    cconst { data: newUser, error: userError } = await supabase
+  .from('users')
+  .insert({
+    id: crypto.randomUUID(),
+    full_name: fullName,
+    phone,
+    role: 'gym_member',
+    gym_id: gymId,
+    is_active: true,
+  })
+  .select()
+  .single();
 
     if (gymError) throw gymError;
 
@@ -642,123 +640,6 @@ app.get('/api/gyms/:userId', async (req, res) => {
   } catch (err) {
     console.error('GET /api/gyms/:userId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch gym' });
-  }
-});
-
-// ── Gym member management ─────────────────────────────────────────────────────
-
-const VALID_MEMBERSHIP_TYPES = ['monthly', 'quarterly', 'half_yearly', 'annual'];
-const TYPE_DURATION_DAYS = {
-  monthly: 30, quarterly: 90, half_yearly: 180, annual: 365,
-};
-
-app.post('/api/gym-members', async (req, res) => {
-  try {
-    const {
-      gymId, fullName, phone, membershipType, monthlyFee,
-      startDate, assignedTrainerId, notes,
-    } = req.body;
-
-    // ── Validation ──────────────────────────────────────────────────
-    if (!gymId)                            return res.status(400).json({ message: 'gymId is required' });
-    if (!fullName || !fullName.trim())     return res.status(400).json({ message: 'Full name is required' });
-    if (!phone || !phone.trim())           return res.status(400).json({ message: 'Phone is required' });
-    if (!/^\d{10}$/.test(phone.trim()))    return res.status(400).json({ message: 'Phone must be 10 digits' });
-    if (!membershipType)                   return res.status(400).json({ message: 'Membership type is required' });
-    if (!VALID_MEMBERSHIP_TYPES.includes(membershipType)) {
-      return res.status(400).json({ message: `Membership type must be one of: ${VALID_MEMBERSHIP_TYPES.join(', ')}` });
-    }
-    const fee = Number(monthlyFee);
-    if (!Number.isFinite(fee) || fee <= 0) {
-      return res.status(400).json({ message: 'Monthly fee must be a positive number' });
-    }
-
-    const trimmedPhone = phone.trim();
-    const trimmedName  = fullName.trim();
-
-    // Resolve startDate (default = today)
-    const start = startDate ? new Date(startDate) : new Date();
-    if (Number.isNaN(start.getTime())) {
-      return res.status(400).json({ message: 'startDate is not a valid date' });
-    }
-    const startISO = start.toISOString().slice(0, 10);
-
-    // Calculate end date
-    const end = new Date(start);
-    end.setDate(end.getDate() + TYPE_DURATION_DAYS[membershipType]);
-    const endISO = end.toISOString().slice(0, 10);
-
-    // ── Duplicate phone check (within this gym) ─────────────────────
-    const { data: existing, error: dupErr } = await supabase
-      .from('users')
-      .select('id, full_name')
-      .eq('gym_id', gymId)
-      .eq('phone', trimmedPhone)
-      .maybeSingle();
-    if (dupErr) throw dupErr;
-    if (existing) {
-      return res.status(409).json({ message: 'Member with this phone already exists' });
-    }
-
-    // ── Insert user (profile-only, no auth account) ─────────────────
-    const { data: user, error: userErr } = await supabase
-      .from('users')
-      .insert({
-        full_name: trimmedName,
-        phone: trimmedPhone,
-        role: 'gym_member',
-        gym_id: gymId,
-        is_active: true,
-      })
-      .select()
-      .single();
-    if (userErr) throw userErr;
-
-    // ── Insert gym_membership; rollback user on failure ─────────────
-    const { data: membership, error: memErr } = await supabase
-      .from('gym_memberships')
-      .insert({
-        user_id: user.id,
-        gym_id: gymId,
-        membership_type: membershipType,
-        monthly_fee: fee,
-        start_date: startISO,
-        end_date: endISO,
-        status: 'active',
-        assigned_trainer_id: assignedTrainerId || null,
-        notes: notes?.trim() || null,
-      })
-      .select()
-      .single();
-
-    if (memErr) {
-      console.error('Membership insert failed, rolling back user:', memErr);
-      await supabase.from('users').delete().eq('id', user.id);
-      throw memErr;
-    }
-
-    res.status(201).json({ user, membership });
-  } catch (err) {
-    console.error('POST /api/gym-members error:', err);
-    res.status(500).json({ message: err.message || 'Failed to create gym member' });
-  }
-});
-
-app.get('/api/gym-trainers/:gymId', async (req, res) => {
-  try {
-    const { gymId } = req.params;
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, full_name, phone')
-      .eq('gym_id', gymId)
-      .eq('role', 'trainer')
-      .eq('is_active', true)
-      .order('full_name', { ascending: true });
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    console.error('GET /api/gym-trainers/:gymId error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch trainers' });
   }
 });
 
