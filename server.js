@@ -593,7 +593,7 @@ app.post('/api/gyms', async (req, res) => {
     }
 
     // Insert gym
-    cconst { data: newUser, error: userError } = await supabase
+    const { data: newUser, error: userError } = await supabase
   .from('users')
   .insert({
     id: crypto.randomUUID(),
