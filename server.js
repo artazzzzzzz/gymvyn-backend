@@ -652,46 +652,71 @@ const TYPE_DURATION_DAYS = {
 
 app.post('/api/gym-members', async (req, res) => {
   try {
+    // Accept both snake_case (new spec) and camelCase (legacy frontend) keys.
     const {
-      gymId, fullName, phone, membershipType, monthlyFee,
-      startDate, assignedTrainerId, notes,
+      gym_id, gymId,
+      full_name, fullName,
+      phone,
+      membership_type, membershipType,
+      monthly_fee, monthlyFee,
+      start_date, startDate,
+      end_date, endDate,
+      assigned_trainer_id, assignedTrainerId,
+      notes,
     } = req.body;
 
+    const gymIdVal       = gym_id || gymId;
+    const fullNameVal    = full_name || fullName;
+    const membershipVal  = membership_type || membershipType;
+    const feeVal         = monthly_fee ?? monthlyFee;
+    const startVal       = start_date || startDate;
+    const endVal         = end_date || endDate;
+    const trainerVal     = assigned_trainer_id || assignedTrainerId || null;
+
     // ── Validation ──────────────────────────────────────────────────
-    if (!gymId)                            return res.status(400).json({ message: 'gymId is required' });
-    if (!fullName || !fullName.trim())     return res.status(400).json({ message: 'Full name is required' });
-    if (!phone || !phone.trim())           return res.status(400).json({ message: 'Phone is required' });
-    if (!/^\d{10}$/.test(phone.trim()))    return res.status(400).json({ message: 'Phone must be 10 digits' });
-    if (!membershipType)                   return res.status(400).json({ message: 'Membership type is required' });
-    if (!VALID_MEMBERSHIP_TYPES.includes(membershipType)) {
-      return res.status(400).json({ message: `Membership type must be one of: ${VALID_MEMBERSHIP_TYPES.join(', ')}` });
+    if (!gymIdVal)                              return res.status(400).json({ message: 'gym_id is required' });
+    if (!fullNameVal || !fullNameVal.trim())    return res.status(400).json({ message: 'full_name is required' });
+    if (!phone || !phone.trim())                return res.status(400).json({ message: 'phone is required' });
+    if (!/^\d{10}$/.test(phone.trim()))         return res.status(400).json({ message: 'phone must be 10 digits' });
+    if (!membershipVal)                         return res.status(400).json({ message: 'membership_type is required' });
+    if (!VALID_MEMBERSHIP_TYPES.includes(membershipVal)) {
+      return res.status(400).json({ message: `membership_type must be one of: ${VALID_MEMBERSHIP_TYPES.join(', ')}` });
     }
-    const fee = Number(monthlyFee);
+    const fee = Number(feeVal);
     if (!Number.isFinite(fee) || fee <= 0) {
-      return res.status(400).json({ message: 'Monthly fee must be a positive number' });
+      return res.status(400).json({ message: 'monthly_fee must be a positive number' });
     }
 
     const trimmedPhone = phone.trim();
-    const trimmedName  = fullName.trim();
+    const trimmedName  = fullNameVal.trim();
 
-    // Resolve startDate (default = today, YYYY-MM-DD)
-    const startISO = startDate
-      ? new Date(startDate).toISOString().slice(0, 10)
+    // Resolve start_date (default = today, YYYY-MM-DD)
+    const startISO = startVal
+      ? new Date(startVal).toISOString().slice(0, 10)
       : new Date().toISOString().slice(0, 10);
     if (Number.isNaN(new Date(startISO).getTime())) {
-      return res.status(400).json({ message: 'startDate is not a valid date' });
+      return res.status(400).json({ message: 'start_date is not a valid date' });
     }
 
-    // Calculate end date
-    const end = new Date(startISO);
-    end.setDate(end.getDate() + TYPE_DURATION_DAYS[membershipType]);
-    const endISO = end.toISOString().slice(0, 10);
+    // end_date: use body value if provided, else compute from membership_type
+    let endISO;
+    if (endVal) {
+      const e = new Date(endVal);
+      if (Number.isNaN(e.getTime())) {
+        return res.status(400).json({ message: 'end_date is not a valid date' });
+      }
+      endISO = e.toISOString().slice(0, 10);
+    } else {
+      const end = new Date(startISO);
+      end.setDate(end.getDate() + TYPE_DURATION_DAYS[membershipVal]);
+      endISO = end.toISOString().slice(0, 10);
+    }
 
     // ── Duplicate phone check (within this gym) ─────────────────────
     const { data: existing, error: dupErr } = await supabase
       .from('users')
       .select('id, full_name')
-      .eq('gym_id', gymId)
+      .eq('gym_id', gymIdVal)
       .eq('phone', trimmedPhone)
       .maybeSingle();
     if (dupErr) throw dupErr;
@@ -700,45 +725,48 @@ app.post('/api/gym-members', async (req, res) => {
     }
 
     // ── Insert user (profile-only, no auth account) ─────────────────
-    const newUserId = crypto.randomUUID();
-    const { data: user, error: userErr } = await supabase
+    // NOTE: users table has NO email column. users.id has NO default — pass it explicitly.
+    const userId = crypto.randomUUID();
+    const { error: userErr } = await supabase
       .from('users')
       .insert({
-        id: newUserId,
+        id: userId,
         full_name: trimmedName,
         phone: trimmedPhone,
         role: 'gym_member',
-        gym_id: gymId,
+        gym_id: gymIdVal,
         is_active: true,
-      })
-      .select()
-      .single();
+      });
     if (userErr) throw userErr;
 
     // ── Insert gym_membership; rollback user on failure ─────────────
     const { data: membership, error: memErr } = await supabase
       .from('gym_memberships')
       .insert({
-        user_id: user.id,
-        gym_id: gymId,
-        membership_type: membershipType,
+        user_id: userId,
+        gym_id: gymIdVal,
+        membership_type: membershipVal,
         monthly_fee: fee,
         start_date: startISO,
         end_date: endISO,
         status: 'active',
-        assigned_trainer_id: assignedTrainerId || null,
+        assigned_trainer_id: trainerVal,
         notes: notes?.trim() || null,
       })
-      .select()
+      .select('id')
       .single();
 
     if (memErr) {
       console.error('Membership insert failed, rolling back user:', memErr);
-      await supabase.from('users').delete().eq('id', user.id);
+      await supabase.from('users').delete().eq('id', userId);
       throw memErr;
     }
 
-    res.status(201).json({ user, membership });
+    res.status(201).json({
+      success: true,
+      user_id: userId,
+      membership_id: membership.id,
+    });
   } catch (err) {
     console.error('POST /api/gym-members error:', err);
     res.status(500).json({ message: err.message || 'Failed to create gym member' });
@@ -748,15 +776,35 @@ app.post('/api/gym-members', async (req, res) => {
 app.get('/api/gym-trainers/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, full_name, phone')
+
+    // Step 1: get active trainer_profiles for this gym
+    const { data: profiles, error: profilesErr } = await supabase
+      .from('trainer_profiles')
+      .select('user_id')
       .eq('gym_id', gymId)
-      .eq('role', 'trainer')
-      .eq('is_active', true)
-      .order('full_name', { ascending: true });
-    if (error) throw error;
-    res.json({ trainers: data || [] });
+      .eq('is_active', true);
+    if (profilesErr) throw profilesErr;
+
+    if (!profiles || profiles.length === 0) {
+      return res.json([]);
+    }
+
+    // Step 2: fetch full_name for each trainer's user_id
+    const userIds = profiles.map(p => p.user_id);
+    const { data: users, error: usersErr } = await supabase
+      .from('users')
+      .select('id, full_name')
+      .in('id', userIds);
+    if (usersErr) throw usersErr;
+
+    // Step 3: shape the response as a bare array of { user_id, full_name }
+    const nameById = new Map((users || []).map(u => [u.id, u.full_name]));
+    const trainers = profiles
+      .map(p => ({ user_id: p.user_id, full_name: nameById.get(p.user_id) || null }))
+      .filter(t => t.full_name)
+      .sort((a, b) => a.full_name.localeCompare(b.full_name));
+
+    res.json(trainers);
   } catch (err) {
     console.error('GET /api/gym-trainers/:gymId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch trainers' });
