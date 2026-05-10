@@ -1600,6 +1600,234 @@ app.get('/api/gym-occupancy/:gymId', async (req, res) => {
   }
 });
 
+// ── Churn scoring (rule-based v1) ────────────────────────────────────────────
+
+function riskLabelFor(score) {
+  if (score >= 61) return 'high';
+  if (score >= 31) return 'medium';
+  return 'low';
+}
+
+function startOfToday() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function startOfMonth() {
+  const d = new Date();
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function daysBetween(later, earlier) {
+  return Math.floor((later.getTime() - earlier.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+app.post('/api/gym-churn/score/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+
+    // 1. Active memberships for this gym
+    const { data: memberships, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('id, user_id, end_date')
+      .eq('gym_id', gymId)
+      .eq('status', 'active');
+    if (memErr) throw memErr;
+
+    if (!memberships || memberships.length === 0) {
+      return res.json({ scored: 0, high_risk: 0, medium_risk: 0, low_risk: 0, members: [] });
+    }
+
+    const userIds = memberships.map(m => m.user_id);
+
+    // 2. Last check-in per user
+    const { data: checkins, error: ciErr } = await supabase
+      .from('check_ins')
+      .select('user_id, checked_in_at')
+      .eq('gym_id', gymId)
+      .in('user_id', userIds)
+      .order('checked_in_at', { ascending: false });
+    if (ciErr) throw ciErr;
+
+    const lastCheckinByUser = new Map();
+    const monthVisitsByUser = new Map();
+    const monthStart = startOfMonth();
+    for (const c of checkins || []) {
+      if (!lastCheckinByUser.has(c.user_id)) {
+        lastCheckinByUser.set(c.user_id, c.checked_in_at);
+      }
+      const t = new Date(c.checked_in_at);
+      if (t >= monthStart) {
+        monthVisitsByUser.set(c.user_id, (monthVisitsByUser.get(c.user_id) || 0) + 1);
+      }
+    }
+
+    // 3. Outstanding payments per user
+    const { data: payments, error: payErr } = await supabase
+      .from('payments')
+      .select('user_id, status')
+      .in('user_id', userIds)
+      .in('status', ['pending', 'overdue']);
+    if (payErr) throw payErr;
+
+    const hasOutstandingByUser = new Set((payments || []).map(p => p.user_id));
+
+    // 4. Score each member
+    const now = new Date();
+    const today = startOfToday();
+    const predictedAt = now.toISOString();
+    const rows = [];
+
+    let highRisk = 0, mediumRisk = 0, lowRisk = 0;
+
+    for (const m of memberships) {
+      let score = 0;
+      const reasons = [];
+
+      const lastIso = lastCheckinByUser.get(m.user_id);
+      const daysSinceCheckin = lastIso
+        ? daysBetween(today, new Date(lastIso))
+        : 9999;
+
+      if (daysSinceCheckin > 14) {
+        score += 30;
+        reasons.push('Inactive over 14 days');
+      } else if (daysSinceCheckin > 7) {
+        score += 15;
+        reasons.push('Inactive over 7 days');
+      }
+      if (daysSinceCheckin > 30) {
+        score += 15;
+        reasons.push('Inactive over 30 days');
+      }
+
+      let expiresInDays = null;
+      if (m.end_date) {
+        const end = new Date(m.end_date);
+        end.setHours(23, 59, 59, 999);
+        expiresInDays = Math.ceil((end.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+        if (expiresInDays <= 14 && expiresInDays >= 0) {
+          score += 20;
+          reasons.push('Expires within 14 days');
+        }
+      }
+
+      const hasOutstanding = hasOutstandingByUser.has(m.user_id);
+      if (hasOutstanding) {
+        score += 25;
+        reasons.push('Outstanding payment');
+      }
+
+      const monthlyVisits = monthVisitsByUser.get(m.user_id) || 0;
+      if (monthlyVisits < 4) {
+        score += 10;
+        reasons.push('Fewer than 4 visits this month');
+      }
+
+      if (score > 100) score = 100;
+      const riskLabel = riskLabelFor(score);
+      if (riskLabel === 'high')   highRisk++;
+      else if (riskLabel === 'medium') mediumRisk++;
+      else lowRisk++;
+
+      rows.push({
+        user_id: m.user_id,
+        gym_id: gymId,
+        membership_id: m.id,
+        score,
+        predicted_at: predictedAt,
+        features_snapshot: {
+          days_since_checkin: daysSinceCheckin === 9999 ? null : daysSinceCheckin,
+          expires_in_days: expiresInDays,
+          has_outstanding: hasOutstanding,
+          monthly_visits: monthlyVisits,
+        },
+        top_reasons: reasons,
+      });
+    }
+
+    // 5. Upsert into churn_scores (one row per user_id + gym_id)
+    if (rows.length > 0) {
+      const { error: upErr } = await supabase
+        .from('churn_scores')
+        .upsert(rows, { onConflict: 'user_id,gym_id' });
+      if (upErr) {
+        // Fallback: if no unique constraint, just insert (GET takes latest)
+        if (/no unique|on conflict|constraint/i.test(upErr.message || '')) {
+          const { error: insErr } = await supabase.from('churn_scores').insert(rows);
+          if (insErr) throw insErr;
+        } else {
+          throw upErr;
+        }
+      }
+    }
+
+    res.json({
+      scored: rows.length,
+      high_risk: highRisk,
+      medium_risk: mediumRisk,
+      low_risk: lowRisk,
+      members: rows,
+    });
+  } catch (err) {
+    console.error('POST /api/gym-churn/score/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to score churn' });
+  }
+});
+
+app.get('/api/gym-churn/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+
+    // Fetch all scores for this gym, newest first; dedupe to latest per user_id.
+    const { data: scores, error: scoreErr } = await supabase
+      .from('churn_scores')
+      .select('user_id, score, predicted_at, features_snapshot, top_reasons')
+      .eq('gym_id', gymId)
+      .order('predicted_at', { ascending: false });
+    if (scoreErr) throw scoreErr;
+
+    const latestByUser = new Map();
+    for (const s of scores || []) {
+      if (!latestByUser.has(s.user_id)) latestByUser.set(s.user_id, s);
+    }
+    const latest = [...latestByUser.values()];
+
+    let users = [];
+    if (latest.length > 0) {
+      const ids = latest.map(s => s.user_id);
+      const { data: usersRows, error: uErr } = await supabase
+        .from('users')
+        .select('id, full_name')
+        .in('id', ids);
+      if (uErr) throw uErr;
+      users = usersRows || [];
+    }
+
+    const nameById = new Map(users.map(u => [u.id, u.full_name]));
+
+    const result = latest
+      .map(s => ({
+        user_id: s.user_id,
+        full_name: nameById.get(s.user_id) || null,
+        score: s.score,
+        risk_label: riskLabelFor(s.score),
+        top_reasons: s.top_reasons || [],
+        predicted_at: s.predicted_at,
+        features_snapshot: s.features_snapshot || {},
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    res.json(result);
+  } catch (err) {
+    console.error('GET /api/gym-churn/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch churn scores' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
 });
