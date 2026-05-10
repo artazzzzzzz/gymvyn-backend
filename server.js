@@ -6,6 +6,7 @@ const { createClient } = require('@supabase/supabase-js');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const { parse: parseCsvSync } = require('csv-parse/sync');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -593,18 +594,22 @@ app.post('/api/gyms', async (req, res) => {
     }
 
     // Insert gym
-    const { data: newUser, error: userError } = await supabase
-  .from('users')
-  .insert({
-    id: crypto.randomUUID(),
-    full_name: fullName,
-    phone,
-    role: 'gym_member',
-    gym_id: gymId,
-    is_active: true,
-  })
-  .select()
-  .single();
+    const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const { data: gym, error: gymError } = await supabase
+      .from('gyms')
+      .insert({
+        name:     gymName.trim(),
+        address:  address?.trim()  || null,
+        city:     city.trim(),
+        state:    state?.trim()    || null,
+        pincode:  pincode?.trim()  || null,
+        phone:    phone.trim(),
+        email:    email?.trim()    || null,
+        owner_id: userId,
+        join_code: joinCode,
+      })
+      .select()
+      .single();
 
     if (gymError) throw gymError;
 
@@ -640,6 +645,68 @@ app.get('/api/gyms/:userId', async (req, res) => {
   } catch (err) {
     console.error('GET /api/gyms/:userId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch gym' });
+  }
+});
+
+app.get('/api/gyms/:gymId/settings', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { data, error } = await supabase
+      .from('gyms')
+      .select('name, address, city, state, pincode, phone, email, logo_url, join_code, plan_tier')
+      .eq('id', gymId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'Gym not found' });
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/gyms/:gymId/settings error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch settings' });
+  }
+});
+
+app.patch('/api/gyms/:gymId/settings', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { name, address, city, state, pincode, phone, email } = req.body;
+    const updates = {};
+    if (name     !== undefined) updates.name     = name;
+    if (address  !== undefined) updates.address  = address;
+    if (city     !== undefined) updates.city     = city;
+    if (state    !== undefined) updates.state    = state;
+    if (pincode  !== undefined) updates.pincode  = pincode;
+    if (phone    !== undefined) updates.phone    = phone;
+    if (email    !== undefined) updates.email    = email;
+
+    const { error } = await supabase.from('gyms').update(updates).eq('id', gymId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/gyms/:gymId/settings error:', err);
+    res.status(500).json({ message: err.message || 'Failed to update settings' });
+  }
+});
+
+const logoStorage = new CloudinaryStorage({
+  cloudinary,
+  params: {
+    folder: 'fitforge/gym-logos',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+  },
+});
+const logoUpload = multer({ storage: logoStorage });
+
+app.post('/api/gyms/:gymId/upload-logo', logoUpload.single('logo'), async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    const logo_url = req.file.path;
+    const { error } = await supabase.from('gyms').update({ logo_url }).eq('id', gymId);
+    if (error) throw error;
+    res.json({ success: true, logo_url });
+  } catch (err) {
+    console.error('POST /api/gyms/:gymId/upload-logo error:', err);
+    res.status(500).json({ message: err.message || 'Failed to upload logo' });
   }
 });
 
@@ -773,6 +840,139 @@ app.post('/api/gym-members', async (req, res) => {
   }
 });
 
+// ── CSV bulk import ───────────────────────────────────────────────────────────
+
+const csvUpload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/gym-members/csv-import', csvUpload.single('file'), async (req, res) => {
+  try {
+    const gymId = req.body.gym_id || req.body.gymId;
+    if (!gymId) return res.status(400).json({ message: 'gym_id is required' });
+    if (!req.file) return res.status(400).json({ message: 'CSV file is required' });
+
+    let records;
+    try {
+      records = parseCsvSync(req.file.buffer, {
+        columns: header => header.map(h => h.trim().toLowerCase()),
+        skip_empty_lines: true,
+        trim: true,
+        bom: true,
+      });
+    } catch (parseErr) {
+      return res.status(400).json({ message: `Invalid CSV: ${parseErr.message}` });
+    }
+
+    let imported = 0;
+    const skipped = [];
+    const errors = [];
+
+    for (let i = 0; i < records.length; i++) {
+      const row = records[i];
+      const rowNum = i + 2; // +1 for 0-index, +1 for header
+
+      const fullName = (row.full_name || '').trim();
+      const phone = (row.phone || '').trim();
+
+      if (!fullName || !phone) {
+        skipped.push({ row: rowNum, reason: 'full_name or phone is empty' });
+        continue;
+      }
+
+      try {
+        const userId = crypto.randomUUID();
+
+        const { error: userErr } = await supabase
+          .from('users')
+          .insert({
+            id: userId,
+            full_name: fullName,
+            phone,
+            role: 'gym_member',
+            gym_id: gymId,
+            is_active: true,
+          });
+        if (userErr) {
+          errors.push({ row: rowNum, reason: userErr.message });
+          continue;
+        }
+
+        const monthlyFee = parseFloat(row.monthly_fee);
+        const membershipPayload = {
+          user_id: userId,
+          gym_id: gymId,
+          membership_type: row.membership_type || null,
+          monthly_fee: Number.isFinite(monthlyFee) ? monthlyFee : null,
+          start_date: row.start_date || null,
+          end_date: row.end_date || null,
+          status: 'active',
+          notes: row.notes || null,
+        };
+        if (row.assigned_trainer_id) {
+          membershipPayload.assigned_trainer_id = row.assigned_trainer_id;
+        }
+
+        const { error: memErr } = await supabase
+          .from('gym_memberships')
+          .insert(membershipPayload);
+        if (memErr) {
+          await supabase.from('users').delete().eq('id', userId);
+          errors.push({ row: rowNum, reason: memErr.message });
+          continue;
+        }
+
+        imported++;
+      } catch (rowErr) {
+        errors.push({ row: rowNum, reason: rowErr.message || 'Unknown error' });
+      }
+    }
+
+    res.json({ imported, skipped: skipped.length, errors });
+  } catch (err) {
+    console.error('POST /api/gym-members/csv-import error:', err);
+    res.status(500).json({ message: err.message || 'Failed to import CSV' });
+  }
+});
+
+// ── Trainer management ────────────────────────────────────────────────────────
+
+app.post('/api/gym-trainers/invite', async (req, res) => {
+  try {
+    const { gym_id, full_name, phone, bio, specialties, hourly_rate } = req.body;
+    if (!gym_id || !full_name) {
+      return res.status(400).json({ message: 'gym_id and full_name are required' });
+    }
+
+    const userId = crypto.randomUUID();
+
+    // Insert into users
+    const { error: userErr } = await supabase
+      .from('users')
+      .insert({ id: userId, full_name, phone: phone || null, role: 'trainer', is_active: true });
+    if (userErr) throw userErr;
+
+    // Insert into trainer_profiles
+    const { error: profileErr } = await supabase
+      .from('trainer_profiles')
+      .insert({
+        user_id: userId,
+        gym_id,
+        bio: bio || null,
+        specialties: specialties || null,
+        hourly_rate: hourly_rate || null,
+        is_active: true,
+      });
+    if (profileErr) {
+      await supabase.from('users').delete().eq('id', userId);
+      throw profileErr;
+    }
+
+    res.status(201).json({ success: true, trainer_id: userId });
+  } catch (err) {
+    console.error('POST /api/gym-trainers/invite error:', err);
+    res.status(500).json({ message: err.message || 'Failed to invite trainer' });
+  }
+});
+
 app.get('/api/gym-trainers/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
@@ -780,7 +980,7 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
     // Step 1: get active trainer_profiles for this gym
     const { data: profiles, error: profilesErr } = await supabase
       .from('trainer_profiles')
-      .select('user_id')
+      .select('user_id, bio, specialties, hourly_rate')
       .eq('gym_id', gymId)
       .eq('is_active', true);
     if (profilesErr) throw profilesErr;
@@ -789,25 +989,479 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
       return res.json([]);
     }
 
-    // Step 2: fetch full_name for each trainer's user_id
+    // Step 2: fetch full_name + phone for each trainer's user_id
     const userIds = profiles.map(p => p.user_id);
     const { data: users, error: usersErr } = await supabase
       .from('users')
-      .select('id, full_name')
+      .select('id, full_name, phone')
       .in('id', userIds);
     if (usersErr) throw usersErr;
 
-    // Step 3: shape the response as a bare array of { user_id, full_name }
-    const nameById = new Map((users || []).map(u => [u.id, u.full_name]));
-    const trainers = profiles
-      .map(p => ({ user_id: p.user_id, full_name: nameById.get(p.user_id) || null }))
-      .filter(t => t.full_name)
+    // Step 3: count active members assigned to each trainer
+    const { data: assignments, error: assignErr } = await supabase
+      .from('gym_memberships')
+      .select('assigned_trainer_id')
+      .in('assigned_trainer_id', userIds)
+      .eq('status', 'active');
+    if (assignErr) throw assignErr;
+
+    const assignedCount = new Map();
+    for (const a of assignments || []) {
+      assignedCount.set(a.assigned_trainer_id, (assignedCount.get(a.assigned_trainer_id) || 0) + 1);
+    }
+
+    const userById = new Map((users || []).map(u => [u.id, u]));
+    const profileByUserId = new Map(profiles.map(p => [p.user_id, p]));
+
+    const trainers = userIds
+      .map(uid => {
+        const u = userById.get(uid);
+        const p = profileByUserId.get(uid);
+        if (!u) return null;
+        return {
+          user_id: uid,
+          full_name: u.full_name,
+          phone: u.phone || null,
+          bio: p?.bio || null,
+          specialties: p?.specialties || null,
+          hourly_rate: p?.hourly_rate || null,
+          members_assigned: assignedCount.get(uid) || 0,
+        };
+      })
+      .filter(Boolean)
       .sort((a, b) => a.full_name.localeCompare(b.full_name));
 
     res.json(trainers);
   } catch (err) {
     console.error('GET /api/gym-trainers/:gymId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch trainers' });
+  }
+});
+
+app.delete('/api/gym-trainers/:trainerId', async (req, res) => {
+  try {
+    const { trainerId } = req.params;
+
+    const { error: profileErr } = await supabase
+      .from('trainer_profiles')
+      .update({ is_active: false })
+      .eq('user_id', trainerId);
+    if (profileErr) throw profileErr;
+
+    const { error: userErr } = await supabase
+      .from('users')
+      .update({ is_active: false })
+      .eq('id', trainerId);
+    if (userErr) throw userErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/gym-trainers/:trainerId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to remove trainer' });
+  }
+});
+
+app.post('/api/gym-members/:memberId/assign-trainer', async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    const { trainer_id } = req.body;
+
+    const { error } = await supabase
+      .from('gym_memberships')
+      .update({ assigned_trainer_id: trainer_id || null })
+      .eq('user_id', memberId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/gym-members/:memberId/assign-trainer error:', err);
+    res.status(500).json({ message: err.message || 'Failed to assign trainer' });
+  }
+});
+
+// ── Gym payments ──────────────────────────────────────────────────────────────
+
+const VALID_PAYMENT_STATUSES = ['pending', 'paid', 'overdue'];
+
+app.get('/api/gym-payments/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { status } = req.query;
+
+    let query = supabase
+      .from('payments')
+      .select('id, user_id, membership_id, amount, due_date, paid_at, status, payment_method, notes, users(full_name)')
+      .eq('gym_id', gymId)
+      .order('due_date', { ascending: false });
+
+    if (status) {
+      if (!VALID_PAYMENT_STATUSES.includes(status)) {
+        return res.status(400).json({ message: `status must be one of: ${VALID_PAYMENT_STATUSES.join(', ')}` });
+      }
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const flattened = (data || []).map(p => ({
+      id: p.id,
+      user_id: p.user_id,
+      full_name: p.users?.full_name ?? null,
+      membership_id: p.membership_id,
+      amount: p.amount,
+      due_date: p.due_date,
+      paid_at: p.paid_at,
+      status: p.status,
+      payment_method: p.payment_method,
+      notes: p.notes,
+    }));
+
+    res.json(flattened);
+  } catch (err) {
+    console.error('GET /api/gym-payments/:gymId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch payments' });
+  }
+});
+
+app.post('/api/gym-payments/:paymentId/mark-paid', async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    const { payment_method, notes } = req.body || {};
+
+    const update = {
+      status: 'paid',
+      paid_at: new Date().toISOString(),
+    };
+    if (payment_method) update.payment_method = String(payment_method).trim();
+    if (notes != null)  update.notes = String(notes).trim() || null;
+
+    const { error } = await supabase
+      .from('payments')
+      .update(update)
+      .eq('id', paymentId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/gym-payments/:paymentId/mark-paid error:', err);
+    res.status(500).json({ message: err.message || 'Failed to mark payment paid' });
+  }
+});
+
+app.post('/api/gym-payments', async (req, res) => {
+  try {
+    const { gym_id, user_id, membership_id, amount, due_date, notes } = req.body || {};
+
+    if (!gym_id)   return res.status(400).json({ message: 'gym_id is required' });
+    if (!user_id)  return res.status(400).json({ message: 'user_id is required' });
+    if (!due_date) return res.status(400).json({ message: 'due_date is required' });
+
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ message: 'amount must be a positive number' });
+    }
+
+    const { data, error } = await supabase
+      .from('payments')
+      .insert({
+        gym_id,
+        user_id,
+        membership_id: membership_id || null,
+        amount: amt,
+        due_date,
+        status: 'pending',
+        notes: notes ? String(notes).trim() || null : null,
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+
+    res.status(201).json({ success: true, payment_id: data.id });
+  } catch (err) {
+    console.error('POST /api/gym-payments error:', err);
+    res.status(500).json({ message: err.message || 'Failed to create payment' });
+  }
+});
+
+// ── Class schedule ────────────────────────────────────────────────────────────
+
+app.get('/api/gym-schedule/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+
+    const { data: classes, error: classErr } = await supabase
+      .from('class_schedule')
+      .select('id, class_name, description, trainer_id, day_of_week, start_time, end_time, capacity')
+      .eq('gym_id', gymId)
+      .eq('is_active', true)
+      .order('day_of_week', { ascending: true })
+      .order('start_time', { ascending: true });
+    if (classErr) throw classErr;
+
+    const trainerIds = [...new Set((classes || []).map(c => c.trainer_id).filter(Boolean))];
+    let nameById = new Map();
+    if (trainerIds.length) {
+      const { data: users, error: userErr } = await supabase
+        .from('users')
+        .select('id, full_name')
+        .in('id', trainerIds);
+      if (userErr) throw userErr;
+      nameById = new Map((users || []).map(u => [u.id, u.full_name]));
+    }
+
+    const result = (classes || []).map(c => ({
+      ...c,
+      trainer_name: nameById.get(c.trainer_id) || null,
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('GET /api/gym-schedule/:gymId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch schedule' });
+  }
+});
+
+app.post('/api/gym-schedule', async (req, res) => {
+  try {
+    const {
+      gym_id, class_name, description, trainer_id,
+      day_of_week, start_time, end_time, capacity,
+    } = req.body || {};
+
+    if (!gym_id)                          return res.status(400).json({ message: 'gym_id is required' });
+    if (!class_name || !class_name.trim()) return res.status(400).json({ message: 'class_name is required' });
+    if (day_of_week == null || Number.isNaN(Number(day_of_week))) {
+      return res.status(400).json({ message: 'day_of_week is required (0-6)' });
+    }
+    if (!start_time)                      return res.status(400).json({ message: 'start_time is required' });
+    if (!end_time)                        return res.status(400).json({ message: 'end_time is required' });
+
+    const cap = Number(capacity);
+    if (!Number.isFinite(cap) || cap <= 0) {
+      return res.status(400).json({ message: 'capacity must be a positive number' });
+    }
+
+    const { data, error } = await supabase
+      .from('class_schedule')
+      .insert({
+        gym_id,
+        class_name: class_name.trim(),
+        description: description?.trim() || null,
+        trainer_id: trainer_id || null,
+        day_of_week: Number(day_of_week),
+        start_time,
+        end_time,
+        capacity: cap,
+        is_active: true,
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+
+    res.status(201).json({ success: true, class_id: data.id });
+  } catch (err) {
+    console.error('POST /api/gym-schedule error:', err);
+    res.status(500).json({ message: err.message || 'Failed to create class' });
+  }
+});
+
+app.delete('/api/gym-schedule/:classId', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const { error } = await supabase
+      .from('class_schedule')
+      .update({ is_active: false })
+      .eq('id', classId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/gym-schedule/:classId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to delete class' });
+  }
+});
+
+// ── Announcements ─────────────────────────────────────────────────────────────
+
+const VALID_PRIORITIES = ['normal', 'important', 'urgent'];
+
+app.get('/api/gym-announcements/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { data, error } = await supabase
+      .from('announcements')
+      .select('id, title, body, priority, created_at')
+      .eq('gym_id', gymId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error('GET /api/gym-announcements/:gymId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch announcements' });
+  }
+});
+
+app.post('/api/gym-announcements', async (req, res) => {
+  try {
+    const { gym_id, posted_by, title, body, priority } = req.body || {};
+
+    if (!gym_id)                    return res.status(400).json({ message: 'gym_id is required' });
+    if (!posted_by)                 return res.status(400).json({ message: 'posted_by is required' });
+    if (!title || !title.trim())    return res.status(400).json({ message: 'title is required' });
+    if (!body || !body.trim())      return res.status(400).json({ message: 'body is required' });
+
+    const pri = priority || 'normal';
+    if (!VALID_PRIORITIES.includes(pri)) {
+      return res.status(400).json({ message: `priority must be one of: ${VALID_PRIORITIES.join(', ')}` });
+    }
+
+    const { data, error } = await supabase
+      .from('announcements')
+      .insert({
+        gym_id,
+        posted_by,
+        title: title.trim(),
+        body: body.trim(),
+        priority: pri,
+        is_active: true,
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+
+    res.status(201).json({ success: true, announcement_id: data.id });
+  } catch (err) {
+    console.error('POST /api/gym-announcements error:', err);
+    res.status(500).json({ message: err.message || 'Failed to post announcement' });
+  }
+});
+
+app.delete('/api/gym-announcements/:announcementId', async (req, res) => {
+  try {
+    const { announcementId } = req.params;
+    const { error } = await supabase
+      .from('announcements')
+      .update({ is_active: false })
+      .eq('id', announcementId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/gym-announcements/:announcementId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to delete announcement' });
+  }
+});
+
+// ── Consumer-side: My Gym ─────────────────────────────────────────────────────
+
+app.get('/api/my-gym/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data: userRow, error: userErr } = await supabase
+      .from('users')
+      .select('gym_id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (userErr) throw userErr;
+
+    if (!userRow || !userRow.gym_id) {
+      return res.json({ linked: false });
+    }
+
+    const gymId = userRow.gym_id;
+
+    const [gymRes, announcementsRes, scheduleRes] = await Promise.all([
+      supabase
+        .from('gyms')
+        .select('name, address, phone, logo_url')
+        .eq('id', gymId)
+        .maybeSingle(),
+      supabase
+        .from('announcements')
+        .select('id, title, body, priority, created_at')
+        .eq('gym_id', gymId)
+        .eq('is_active', true)
+        .order('created_at', { ascending: false })
+        .limit(10),
+      supabase
+        .from('class_schedule')
+        .select('id, class_name, description, trainer_id, day_of_week, start_time, end_time, capacity')
+        .eq('gym_id', gymId)
+        .eq('is_active', true)
+        .order('day_of_week', { ascending: true })
+        .order('start_time', { ascending: true }),
+    ]);
+
+    if (gymRes.error)           throw gymRes.error;
+    if (announcementsRes.error) throw announcementsRes.error;
+    if (scheduleRes.error)      throw scheduleRes.error;
+
+    const schedule = scheduleRes.data || [];
+    const trainerIds = [...new Set(schedule.map(s => s.trainer_id).filter(Boolean))];
+    let nameById = new Map();
+    if (trainerIds.length) {
+      const { data: trainerUsers, error: trainerUsersErr } = await supabase
+        .from('users')
+        .select('id, full_name')
+        .in('id', trainerIds);
+      if (trainerUsersErr) throw trainerUsersErr;
+      nameById = new Map((trainerUsers || []).map(u => [u.id, u.full_name]));
+    }
+
+    res.json({
+      linked: true,
+      gym: gymRes.data || null,
+      announcements: announcementsRes.data || [],
+      schedule: schedule.map(s => ({ ...s, trainer_name: nameById.get(s.trainer_id) || null })),
+    });
+  } catch (err) {
+    console.error('GET /api/my-gym/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch gym' });
+  }
+});
+
+app.post('/api/gym-join', async (req, res) => {
+  try {
+    const { user_id, join_code } = req.body || {};
+
+    if (!user_id)  return res.status(400).json({ message: 'user_id is required' });
+    if (!join_code || !join_code.trim()) {
+      return res.status(400).json({ message: 'join_code is required' });
+    }
+
+    const code = join_code.trim().toUpperCase();
+    const { data: gym, error: gymErr } = await supabase
+      .from('gyms')
+      .select('id, name, is_active')
+      .eq('join_code', code)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (gymErr) throw gymErr;
+
+    if (!gym) return res.status(404).json({ error: 'Invalid join code' });
+
+    // Don't downgrade an existing gym owner to gym_member.
+    const { data: existing, error: existingErr } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', user_id)
+      .maybeSingle();
+    if (existingErr) throw existingErr;
+
+    const update = { gym_id: gym.id };
+    if (existing?.role !== 'gym_owner') update.role = 'gym_member';
+
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update(update)
+      .eq('id', user_id);
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true, gym_name: gym.name });
+  } catch (err) {
+    console.error('POST /api/gym-join error:', err);
+    res.status(500).json({ message: err.message || 'Failed to join gym' });
   }
 });
 
