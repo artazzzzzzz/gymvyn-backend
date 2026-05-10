@@ -1465,6 +1465,141 @@ app.post('/api/gym-join', async (req, res) => {
   }
 });
 
+// ── QR check-in ──────────────────────────────────────────────────────────────
+
+app.get('/api/gym-qr/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { data, error } = await supabase
+      .from('gyms')
+      .select('join_code')
+      .eq('id', gymId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Gym not found' });
+    res.json({
+      gymId,
+      joinCode: data.join_code,
+      qrData: `fitforge:checkin:${gymId}`,
+    });
+  } catch (err) {
+    console.error('GET /api/gym-qr/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch QR data' });
+  }
+});
+
+function todayMidnightIso() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+app.post('/api/checkin', async (req, res) => {
+  try {
+    const { userId, gymId, method } = req.body;
+    if (!userId || !gymId) {
+      return res.status(400).json({ error: 'userId and gymId are required' });
+    }
+    const checkinMethod = method === 'qr' || method === 'manual' ? method : 'qr';
+
+    // Verify active membership
+    const { data: membership, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('gym_id', gymId)
+      .eq('status', 'active')
+      .maybeSingle();
+    if (memErr) throw memErr;
+    if (!membership) {
+      return res.status(403).json({ error: 'No active membership' });
+    }
+
+    // Already checked in today (no checkout)?
+    const { data: openCheckin, error: openErr } = await supabase
+      .from('check_ins')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('gym_id', gymId)
+      .is('checked_out_at', null)
+      .gte('checked_in_at', todayMidnightIso())
+      .maybeSingle();
+    if (openErr) throw openErr;
+    if (openCheckin) {
+      return res.status(409).json({ error: 'Already checked in' });
+    }
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('check_ins')
+      .insert({
+        user_id: userId,
+        gym_id: gymId,
+        membership_id: membership.id,
+        checked_in_at: new Date().toISOString(),
+        method: checkinMethod,
+      })
+      .select('id')
+      .single();
+    if (insErr) throw insErr;
+
+    res.json({ success: true, checkin_id: inserted.id });
+  } catch (err) {
+    console.error('POST /api/checkin error:', err);
+    res.status(500).json({ error: err.message || 'Failed to check in' });
+  }
+});
+
+app.post('/api/checkout', async (req, res) => {
+  try {
+    const { userId, gymId } = req.body;
+    if (!userId || !gymId) {
+      return res.status(400).json({ error: 'userId and gymId are required' });
+    }
+
+    const { data: open, error: openErr } = await supabase
+      .from('check_ins')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('gym_id', gymId)
+      .is('checked_out_at', null)
+      .order('checked_in_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (openErr) throw openErr;
+    if (!open) {
+      return res.status(404).json({ error: 'No active check-in found' });
+    }
+
+    const { error: updErr } = await supabase
+      .from('check_ins')
+      .update({ checked_out_at: new Date().toISOString() })
+      .eq('id', open.id);
+    if (updErr) throw updErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/checkout error:', err);
+    res.status(500).json({ error: err.message || 'Failed to check out' });
+  }
+});
+
+app.get('/api/gym-occupancy/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { count, error } = await supabase
+      .from('check_ins')
+      .select('id', { count: 'exact', head: true })
+      .eq('gym_id', gymId)
+      .is('checked_out_at', null)
+      .gte('checked_in_at', todayMidnightIso());
+    if (error) throw error;
+    res.json({ current: count || 0, asOf: new Date().toISOString() });
+  } catch (err) {
+    console.error('GET /api/gym-occupancy/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch occupancy' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
 });
