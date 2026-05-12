@@ -7,6 +7,8 @@ const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const { parse: parseCsvSync } = require('csv-parse/sync');
+const cron = require('node-cron');
+const ml = require('./ml_client');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1827,6 +1829,103 @@ app.get('/api/gym-churn/:gymId', async (req, res) => {
     res.status(500).json({ error: err.message || 'Failed to fetch churn scores' });
   }
 });
+
+// ── ML service integration ──────────────────────────────────────────────────
+
+app.get('/api/ml/status', async (req, res) => {
+  try {
+    const info = await ml.modelInfo();
+    res.json(info);
+  } catch (err) {
+    console.error('GET /api/ml/status error:', err);
+    res.status(503).json({ message: 'ML service unreachable', error: err.message });
+  }
+});
+
+app.post('/api/ml/score/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    if (!gymId) return res.status(400).json({ message: 'gymId is required' });
+    const result = await ml.batchScoreGym(gymId);
+    res.json(result);
+  } catch (err) {
+    console.error('POST /api/ml/score/:gymId error:', err);
+    res.status(500).json({ message: 'Failed to score gym', error: err.message });
+  }
+});
+
+app.get('/api/ml/scores/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { data: scores, error } = await supabase
+      .from('churn_scores')
+      .select('user_id, gym_id, membership_id, score, predicted_at, features_snapshot, top_reasons')
+      .eq('gym_id', gymId)
+      .order('score', { ascending: false });
+    if (error) throw error;
+
+    if (!scores || scores.length === 0) {
+      return res.json({ scores: [], summary: { total: 0, high: 0, medium: 0, low: 0 } });
+    }
+
+    const latest = {};
+    for (const s of scores) {
+      if (!latest[s.user_id] || new Date(s.predicted_at) > new Date(latest[s.user_id].predicted_at)) {
+        latest[s.user_id] = s;
+      }
+    }
+    const latestArr = Object.values(latest);
+
+    const userIds = latestArr.map(s => s.user_id);
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, full_name, phone')
+      .in('id', userIds);
+    const userMap = Object.fromEntries((users || []).map(u => [u.id, u]));
+
+    const enriched = latestArr.map(s => ({
+      ...s,
+      full_name: userMap[s.user_id]?.full_name || 'Unknown',
+      phone:     userMap[s.user_id]?.phone     || null,
+      risk_label: s.score >= 61 ? 'high' : s.score >= 31 ? 'medium' : 'low',
+    }));
+
+    const summary = {
+      total:  enriched.length,
+      high:   enriched.filter(s => s.score >= 61).length,
+      medium: enriched.filter(s => s.score >= 31 && s.score < 61).length,
+      low:    enriched.filter(s => s.score < 31).length,
+    };
+
+    res.json({ scores: enriched, summary });
+  } catch (err) {
+    console.error('GET /api/ml/scores/:gymId error:', err);
+    res.status(500).json({ message: 'Failed to fetch scores', error: err.message });
+  }
+});
+
+// Daily churn scoring — 20:30 UTC = 02:00 IST.
+cron.schedule('30 20 * * *', async () => {
+  console.log('🕑 Daily churn scoring started at', new Date().toISOString());
+  try {
+    const { data: gyms, error } = await supabase
+      .from('gyms')
+      .select('id, name')
+      .eq('is_active', true);
+    if (error) throw error;
+    for (const gym of gyms || []) {
+      try {
+        const result = await ml.batchScoreGym(gym.id);
+        console.log(`✅ Scored ${gym.name}: ${result.scored} members, ${result.high_risk} high risk`);
+      } catch (e) {
+        console.error(`❌ Failed scoring ${gym.name}:`, e.message);
+      }
+    }
+    console.log('🕑 Daily churn scoring complete at', new Date().toISOString());
+  } catch (err) {
+    console.error('🕑 Daily churn scoring crashed:', err);
+  }
+}, { timezone: 'UTC' });
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
