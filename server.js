@@ -2039,22 +2039,30 @@ app.get('/api/macros/:userId', async (req, res) => {
   }
 });
 
-// Debug: reveal actual food_logs columns (remove after confirming schema)
+// Debug: probe every candidate column one-by-one to reveal actual food_logs schema
 app.get('/api/debug/food-logs-columns', async (req, res) => {
-  try {
-    // Attempt a select with known column list so PostgREST errors show which ones are missing
-    const { data, error } = await supabase
-      .from('food_logs')
-      .select('id, user_id, log_date, meal_type, food_name, quantity, serving_unit, calories, protein_g, carbs_g, fat_g, logged_via, food_id, created_at')
-      .limit(0);
-    if (error) {
-      console.error('Debug food_logs columns error:', JSON.stringify(error, null, 2));
-      return res.status(500).json({ error: error.message, hint: error.hint, details: error.details });
+  const candidates = [
+    'id','user_id','date','log_date','meal_type','food_name','food_item',
+    'quantity','qty','serving_unit','serving_description',
+    'calories','kcal','calories_consumed',
+    'protein','protein_g','proteins',
+    'carbs','carbs_g','carbohydrates','carb_g',
+    'fat','fat_g','fats',
+    'fiber','fiber_g',
+    'logged_via','source','method',
+    'food_id','notes','created_at','updated_at',
+  ];
+  const exists = [];
+  const missing = [];
+  for (const col of candidates) {
+    const { error } = await supabase.from('food_logs').select(col).limit(0);
+    if (error && error.message.includes('does not exist')) {
+      missing.push(col);
+    } else {
+      exists.push(col);
     }
-    res.json({ ok: true, message: 'All expected columns exist in food_logs' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
+  res.json({ exists, missing });
 });
 
 // Route 3: POST /api/food-logs
