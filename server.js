@@ -2039,6 +2039,24 @@ app.get('/api/macros/:userId', async (req, res) => {
   }
 });
 
+// Debug: reveal actual food_logs columns (remove after confirming schema)
+app.get('/api/debug/food-logs-columns', async (req, res) => {
+  try {
+    // Attempt a select with known column list so PostgREST errors show which ones are missing
+    const { data, error } = await supabase
+      .from('food_logs')
+      .select('id, user_id, log_date, meal_type, food_name, quantity, serving_unit, calories, protein_g, carbs_g, fat_g, logged_via, food_id, created_at')
+      .limit(0);
+    if (error) {
+      console.error('Debug food_logs columns error:', JSON.stringify(error, null, 2));
+      return res.status(500).json({ error: error.message, hint: error.hint, details: error.details });
+    }
+    res.json({ ok: true, message: 'All expected columns exist in food_logs' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Route 3: POST /api/food-logs
 app.post('/api/food-logs', async (req, res) => {
   try {
@@ -2067,7 +2085,10 @@ app.post('/api/food-logs', async (req, res) => {
       })
       .select()
       .single();
-    if (error) throw error;
+    if (error) {
+      console.error('Food log insert error:', JSON.stringify(error, null, 2));
+      return res.status(500).json({ message: error.message, details: error.details, hint: error.hint });
+    }
     res.json(data);
   } catch (err) {
     console.error('log food error:', err);
