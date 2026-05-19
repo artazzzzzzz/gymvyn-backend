@@ -2039,31 +2039,6 @@ app.get('/api/macros/:userId', async (req, res) => {
   }
 });
 
-// Debug: probe every candidate column one-by-one to reveal actual food_logs schema
-app.get('/api/debug/food-logs-columns', async (req, res) => {
-  const candidates = [
-    'id','user_id','date','log_date','meal_type','food_name','food_item',
-    'quantity','qty','serving_unit','serving_description',
-    'calories','kcal','calories_consumed',
-    'protein','protein_g','proteins',
-    'carbs','carbs_g','carbohydrates','carb_g',
-    'fat','fat_g','fats',
-    'fiber','fiber_g',
-    'logged_via','source','method',
-    'food_id','notes','created_at','updated_at',
-  ];
-  const exists = [];
-  const missing = [];
-  for (const col of candidates) {
-    const { error } = await supabase.from('food_logs').select(col).limit(0);
-    if (error && error.message.includes('does not exist')) {
-      missing.push(col);
-    } else {
-      exists.push(col);
-    }
-  }
-  res.json({ exists, missing });
-});
 
 // Route 3: POST /api/food-logs
 app.post('/api/food-logs', async (req, res) => {
