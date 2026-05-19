@@ -22,7 +22,7 @@ const allowedOrigins = [
 
 app.use(cors());
 
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -1927,6 +1927,463 @@ cron.schedule('30 20 * * *', async () => {
   }
 }, { timezone: 'UTC' });
 
+// ── Diet redesign: macros, food logs, food search, AI diet plan ──────────────
+
+const ACTIVITY_MULTIPLIERS = {
+  sedentary: 1.2,
+  light: 1.375,
+  moderate: 1.55,
+  active: 1.725,
+  very_active: 1.9,
+};
+
+async function computeMacrosForUser(userId) {
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('current_weight, height, age, goal, activity_level, gender')
+    .eq('id', userId)
+    .single();
+  if (error || !user) throw new Error('User not found');
+
+  const weight = Number(user.current_weight);
+  const height = Number(user.height);
+  const age = Number(user.age);
+  if (!weight || !height || !age) {
+    throw new Error('User missing weight/height/age — complete onboarding first');
+  }
+
+  const gender = (user.gender || 'male').toLowerCase();
+  const activity = (user.activity_level || 'moderate').toLowerCase();
+  const multiplier = ACTIVITY_MULTIPLIERS[activity] ?? ACTIVITY_MULTIPLIERS.moderate;
+
+  const bmrBase = (10 * weight) + (6.25 * height) - (5 * age);
+  const bmr = gender === 'female' ? bmrBase - 161 : bmrBase + 5;
+  const tdee = bmr * multiplier;
+
+  const goal = (user.goal || '').toLowerCase();
+  let calories = tdee;
+  let proteinPerKg = 1.6;
+  let goalAdjustment = 0;
+  if (goal.includes('lose') || goal.includes('cut')) {
+    goalAdjustment = -450;
+    calories = tdee - 450;
+    proteinPerKg = 2.0;
+  } else if (goal.includes('gain') || goal.includes('bulk')) {
+    goalAdjustment = 350;
+    calories = tdee + 350;
+    proteinPerKg = 1.8;
+  } else if (goal.includes('maintain') || goal.includes('athletic')) {
+    proteinPerKg = 1.6;
+  }
+
+  const protein_g = Math.round(proteinPerKg * weight);
+  const proteinCalories = protein_g * 4;
+  const fatCalories = calories * 0.25;
+  const fat_g = Math.round(fatCalories / 9);
+  const carbsCalories = calories - proteinCalories - fatCalories;
+  const carbs_g = Math.round(carbsCalories / 4);
+
+  const row = {
+    user_id: userId,
+    calories: Math.round(calories),
+    protein_g,
+    carbs_g,
+    fat_g,
+    bmr: Math.round(bmr),
+    tdee: Math.round(tdee),
+    activity_level: activity,
+    goal_adjustment: goalAdjustment,
+    formula: 'mifflin_st_jeor',
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data: upserted, error: upsertError } = await supabase
+    .from('user_macros')
+    .upsert(row, { onConflict: 'user_id' })
+    .select()
+    .single();
+  if (upsertError) throw upsertError;
+
+  return upserted;
+}
+
+// Route 1: POST /api/macros/calculate
+app.post('/api/macros/calculate', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ message: 'userId is required' });
+    const macros = await computeMacrosForUser(userId);
+    res.json({ success: true, macros });
+  } catch (err) {
+    console.error('calculate macros error:', err);
+    res.status(500).json({ message: err.message || 'Failed to calculate macros' });
+  }
+});
+
+// Route 2: GET /api/macros/:userId
+app.get('/api/macros/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('user_macros')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return res.json({ success: true, macros: data });
+    const macros = await computeMacrosForUser(userId);
+    res.json({ success: true, macros });
+  } catch (err) {
+    console.error('get macros error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch macros' });
+  }
+});
+
+// Route 3: POST /api/food-logs
+app.post('/api/food-logs', async (req, res) => {
+  try {
+    const {
+      userId, log_date, date, mealType, foodName, quantity, servingUnit,
+      calories, proteinG, carbsG, fatG, loggedVia, foodId,
+    } = req.body;
+    if (!userId || !mealType || !foodName || calories == null) {
+      return res.status(400).json({ message: 'userId, mealType, foodName, calories are required' });
+    }
+    const { data, error } = await supabase
+      .from('food_logs')
+      .insert({
+        user_id: userId,
+        log_date: log_date || date || new Date().toISOString().slice(0, 10),
+        meal_type: mealType,
+        food_name: foodName,
+        quantity: quantity ?? 1,
+        serving_unit: servingUnit ?? null,
+        calories,
+        protein_g: proteinG ?? 0,
+        carbs_g: carbsG ?? 0,
+        fat_g: fatG ?? 0,
+        logged_via: loggedVia || 'manual',
+        food_id: foodId ?? null,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('log food error:', err);
+    res.status(500).json({ message: err.message || 'Failed to log food' });
+  }
+});
+
+// Route 4: GET /api/food-logs/:userId?date=YYYY-MM-DD
+app.get('/api/food-logs/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+    const { data, error } = await supabase
+      .from('food_logs')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('log_date', date)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const mealOrder = { breakfast: 0, lunch: 1, snack: 2, dinner: 3 };
+    const logs = (data || []).slice().sort((a, b) => {
+      const ma = mealOrder[a.meal_type] ?? 99;
+      const mb = mealOrder[b.meal_type] ?? 99;
+      if (ma !== mb) return ma - mb;
+      return new Date(a.created_at) - new Date(b.created_at);
+    });
+
+    const totals = logs.reduce((acc, l) => {
+      acc.totalCalories += Number(l.calories) || 0;
+      acc.totalProtein  += Number(l.protein_g) || 0;
+      acc.totalCarbs    += Number(l.carbs_g) || 0;
+      acc.totalFat      += Number(l.fat_g) || 0;
+      return acc;
+    }, { totalCalories: 0, totalProtein: 0, totalCarbs: 0, totalFat: 0 });
+
+    res.json({ logs, totals });
+  } catch (err) {
+    console.error('get food logs error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch food logs' });
+  }
+});
+
+// Route 5: DELETE /api/food-logs/:logId
+app.delete('/api/food-logs/:logId', async (req, res) => {
+  try {
+    const { logId } = req.params;
+    const { error } = await supabase.from('food_logs').delete().eq('id', logId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('delete food log error:', err);
+    res.status(500).json({ message: err.message || 'Failed to delete food log' });
+  }
+});
+
+// Route 6: GET /api/food-search?q=...
+app.get('/api/food-search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.json([]);
+    const safe = q.replace(/[%,()]/g, ' ');
+    const { data, error } = await supabase
+      .from('food_database')
+      .select('*')
+      .or(`name.ilike.%${safe}%,name_hindi.ilike.%${safe}%,category.ilike.%${safe}%`)
+      .order('is_combo', { ascending: false })
+      .order('name', { ascending: true })
+      .limit(20);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error('food search error:', err);
+    res.status(500).json({ message: err.message || 'Failed to search foods' });
+  }
+});
+
+// Route 7: POST /api/food-logs/voice
+app.post('/api/food-logs/voice', async (req, res) => {
+  try {
+    const { userId, transcript, mealType } = req.body;
+    if (!userId || !transcript || !mealType) {
+      return res.status(400).json({ message: 'userId, transcript, mealType are required' });
+    }
+
+    const systemPrompt = `You are a food nutrition parser for an Indian fitness app. The user will describe what they ate in English or Hinglish. Extract each food item with estimated quantity and nutritional info per serving. Return ONLY valid JSON array, no markdown, no explanation:
+[
+  {
+    "food_name": "string",
+    "quantity": number,
+    "serving_unit": "plate/bowl/piece/cup/glass/katori",
+    "calories": number,
+    "protein_g": number,
+    "carbs_g": number,
+    "fat_g": number
+  }
+]
+Use Indian food nutrition data. Common references:
+- 1 roti/chapati: ~120 cal, 3g protein, 20g carbs, 3.5g fat
+- 1 katori dal: ~150 cal, 9g protein, 20g carbs, 4g fat
+- 1 plate rice (150g cooked): ~180 cal, 3.5g protein, 40g carbs, 0.4g fat
+- 1 katori sabzi (avg): ~120 cal, 3g protein, 10g carbs, 7g fat
+- 1 egg (boiled): ~78 cal, 6g protein, 0.6g carbs, 5g fat
+- 1 glass milk (250ml): ~150 cal, 8g protein, 12g carbs, 8g fat
+- 1 scoop whey protein: ~120 cal, 24g protein, 3g carbs, 1.5g fat
+- 1 banana: ~105 cal, 1.3g protein, 27g carbs, 0.4g fat
+- 1 plate chicken curry (150g): ~250 cal, 25g protein, 8g carbs, 14g fat
+- 1 plate rajma chawal: ~400 cal, 15g protein, 65g carbs, 8g fat
+Be generous with common sense. If someone says 'lunch mein dal chawal khaya' assume 1 katori dal + 1 plate rice.`;
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const result = await model.generateContent([
+      { text: systemPrompt },
+      { text: `User said: "${transcript}"` },
+    ]);
+    const text = result.response.text();
+    const items = extractJson(text);
+    if (!Array.isArray(items)) throw new Error('Gemini did not return a JSON array');
+
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = items.map((it) => ({
+      user_id: userId,
+      log_date: today,
+      meal_type: mealType,
+      food_name: it.food_name,
+      quantity: it.quantity ?? 1,
+      serving_unit: it.serving_unit ?? null,
+      calories: it.calories ?? 0,
+      protein_g: it.protein_g ?? 0,
+      carbs_g: it.carbs_g ?? 0,
+      fat_g: it.fat_g ?? 0,
+      logged_via: 'voice',
+    }));
+
+    if (rows.length === 0) return res.json([]);
+
+    const { data, error } = await supabase.from('food_logs').insert(rows).select();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('voice food log error:', err);
+    res.status(500).json({ message: err.message || 'Failed to log food via voice' });
+  }
+});
+
+// Route 8: POST /api/food-logs/camera
+app.post('/api/food-logs/camera', async (req, res) => {
+  try {
+    const { userId, imageBase64, mealType } = req.body;
+    if (!userId || !imageBase64 || !mealType) {
+      return res.status(400).json({ message: 'userId, imageBase64, mealType are required' });
+    }
+
+    const prompt = `Look at this photo of food. Identify each food item visible. For each item, estimate the portion size and nutritional content. Focus on Indian food if applicable. Return ONLY valid JSON array:
+[
+  {
+    "food_name": "string",
+    "quantity": number,
+    "serving_unit": "plate/bowl/piece/cup/glass/katori",
+    "calories": number,
+    "protein_g": number,
+    "carbs_g": number,
+    "fat_g": number,
+    "confidence": "high/medium/low"
+  }
+]
+If you can't identify the food clearly, set confidence to 'low'. Be reasonable with portion estimates.`;
+
+    const cleanedB64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const mimeMatch = imageBase64.match(/^data:(image\/\w+);base64,/);
+    const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { mimeType, data: cleanedB64 } },
+    ]);
+    const text = result.response.text();
+    const items = extractJson(text);
+    if (!Array.isArray(items)) throw new Error('Gemini did not return a JSON array');
+
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = items.map((it) => ({
+      user_id: userId,
+      log_date: today,
+      meal_type: mealType,
+      food_name: it.food_name,
+      quantity: it.quantity ?? 1,
+      serving_unit: it.serving_unit ?? null,
+      calories: it.calories ?? 0,
+      protein_g: it.protein_g ?? 0,
+      carbs_g: it.carbs_g ?? 0,
+      fat_g: it.fat_g ?? 0,
+      logged_via: 'camera',
+    }));
+
+    if (rows.length === 0) return res.json([]);
+
+    const { data, error } = await supabase.from('food_logs').insert(rows).select();
+    if (error) throw error;
+
+    const withConfidence = data.map((row, i) => ({
+      ...row,
+      confidence: items[i]?.confidence ?? 'medium',
+    }));
+    res.json(withConfidence);
+  } catch (err) {
+    console.error('camera food log error:', err);
+    res.status(500).json({ message: err.message || 'Failed to log food via camera' });
+  }
+});
+
+// Route 9: POST /api/diet-plan/generate
+app.post('/api/diet-plan/generate', async (req, res) => {
+  try {
+    const { userId, dietType = 'non_veg', cuisinePref = 'north_indian' } = req.body;
+    if (!userId) return res.status(400).json({ message: 'userId is required' });
+
+    const { data: existing } = await supabase
+      .from('user_macros')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+    const macros = existing || await computeMacrosForUser(userId);
+
+    const prompt = `Generate a 7-day Indian diet plan. Requirements:
+- Daily target: ${macros.calories} calories, ${macros.protein_g}g protein, ${macros.carbs_g}g carbs, ${macros.fat_g}g fat
+- Diet type: ${dietType}
+- Cuisine: ${cuisinePref}
+- Budget-friendly, realistic Indian meals
+- Use familiar portions: roti count, katori for dal/sabzi, plate for rice, glass for milk/lassi
+- Include 4 meals per day: breakfast, lunch, snack, dinner
+- Each meal should list items with individual calories and macros
+
+Return ONLY valid JSON, no markdown:
+{
+  "daily_targets": { "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number },
+  "days": [
+    {
+      "day": 1,
+      "day_name": "Monday",
+      "meals": [
+        {
+          "meal_type": "breakfast",
+          "items": [
+            { "name": "string", "quantity": "2 pieces", "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number }
+          ],
+          "meal_calories": number
+        }
+      ],
+      "day_total": { "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number }
+    }
+  ]
+}`;
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const result = await model.generateContent(prompt);
+    const planData = extractJson(result.response.text());
+
+    await supabase
+      .from('user_diet_plans')
+      .update({ is_active: false })
+      .eq('user_id', userId)
+      .eq('is_active', true);
+
+    const { data, error } = await supabase
+      .from('user_diet_plans')
+      .insert({
+        user_id: userId,
+        plan_data: planData,
+        diet_type: dietType,
+        cuisine_pref: cuisinePref,
+        is_active: true,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json(data);
+  } catch (err) {
+    console.error('generate diet plan error:', err);
+    res.status(500).json({ message: err.message || 'Failed to generate diet plan' });
+  }
+});
+
+// Route 10: GET /api/diet-plan/:userId
+app.get('/api/diet-plan/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('user_diet_plans')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('generated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    res.json(data || null);
+  } catch (err) {
+    console.error('get diet plan error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch diet plan' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
+  console.log('Diet redesign routes registered:');
+  console.log('  POST   /api/macros/calculate');
+  console.log('  GET    /api/macros/:userId');
+  console.log('  POST   /api/food-logs');
+  console.log('  GET    /api/food-logs/:userId');
+  console.log('  DELETE /api/food-logs/:logId');
+  console.log('  GET    /api/food-search');
+  console.log('  POST   /api/food-logs/voice');
+  console.log('  POST   /api/food-logs/camera');
+  console.log('  POST   /api/diet-plan/generate');
+  console.log('  GET    /api/diet-plan/:userId');
 });
