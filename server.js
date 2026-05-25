@@ -2377,6 +2377,49 @@ app.get('/api/diet-plan/:userId', async (req, res) => {
   }
 });
 
+// ── Workout session ───────────────────────────────────────────────────────────
+
+// POST /api/workout/finish
+// Uses service-role key → direct Postgres driver, bypasses PostgREST schema
+// cache entirely.  Fixes "exercises column not found" on workout_logs.
+app.post('/api/workout/finish', async (req, res) => {
+  try {
+    const { sessionId, durationMinutes, exercises, sets } = req.body;
+
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+    const { error: updateError } = await supabase
+      .from('workout_logs')
+      .update({
+        completed_at:     new Date().toISOString(),
+        duration_minutes: durationMinutes,
+        exercises:        exercises,
+      })
+      .eq('id', sessionId);
+
+    if (updateError) {
+      console.error('Workout log update error:', updateError);
+      return res.status(500).json({ error: updateError.message });
+    }
+
+    if (sets && sets.length > 0) {
+      const { error: setsError } = await supabase
+        .from('workout_set_logs')
+        .insert(sets);
+
+      if (setsError) {
+        console.error('Set logs insert error:', setsError);
+        return res.status(500).json({ error: setsError.message });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Finish workout error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
   console.log('Diet redesign routes registered:');
@@ -2390,4 +2433,6 @@ app.listen(PORT, () => {
   console.log('  POST   /api/food-logs/camera');
   console.log('  POST   /api/diet-plan/generate');
   console.log('  GET    /api/diet-plan/:userId');
+  console.log('Workout session routes registered:');
+  console.log('  POST   /api/workout/finish');
 });
