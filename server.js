@@ -2377,6 +2377,72 @@ app.get('/api/diet-plan/:userId', async (req, res) => {
   }
 });
 
+// ── Custom Saved Meals ────────────────────────────────────────────────────────
+
+// POST /api/custom-meals
+app.post('/api/custom-meals', async (req, res) => {
+  try {
+    const { userId, name, items } = req.body;
+    if (!userId || !name || !Array.isArray(items)) {
+      return res.status(400).json({ error: 'userId, name, and items are required' });
+    }
+    const totals = items.reduce((acc, item) => ({
+      calories: acc.calories + (Number(item.calories)  || 0),
+      protein:  acc.protein  + (Number(item.protein_g) || 0),
+      carbs:    acc.carbs    + (Number(item.carbs_g)   || 0),
+      fat:      acc.fat      + (Number(item.fat_g)     || 0),
+    }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
+
+    const { data, error } = await supabase
+      .from('custom_meals')
+      .insert({
+        user_id:         userId,
+        name,
+        items,
+        total_calories:  totals.calories,
+        total_protein_g: totals.protein,
+        total_carbs_g:   totals.carbs,
+        total_fat_g:     totals.fat,
+      })
+      .select()
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/custom-meals/:userId
+app.get('/api/custom-meals/:userId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('custom_meals')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/custom-meals/:mealId
+app.delete('/api/custom-meals/:mealId', async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('custom_meals')
+      .delete()
+      .eq('id', req.params.mealId);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Workout session ───────────────────────────────────────────────────────────
 
 // POST /api/workout/finish
@@ -2419,6 +2485,8 @@ app.post('/api/workout/finish', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+require('./trainerRoutes')(app, supabase);
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
