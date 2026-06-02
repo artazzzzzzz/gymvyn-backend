@@ -2128,26 +2128,7 @@ app.delete('/api/food-logs/:logId', async (req, res) => {
   }
 });
 
-// Route 6: GET /api/food-search?q=...
-app.get('/api/food-search', async (req, res) => {
-  try {
-    const q = (req.query.q || '').toString().trim();
-    if (!q) return res.json([]);
-    const safe = q.replace(/[%,()]/g, ' ');
-    const { data, error } = await supabase
-      .from('food_database')
-      .select('*')
-      .or(`name.ilike.%${safe}%,name_hindi.ilike.%${safe}%,category.ilike.%${safe}%`)
-      .order('is_combo', { ascending: false })
-      .order('name', { ascending: true })
-      .limit(20);
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    console.error('food search error:', err);
-    res.status(500).json({ message: err.message || 'Failed to search foods' });
-  }
-});
+// Replaced by foodSearchRoutes.js
 
 // Route 7: POST /api/food-logs/voice
 app.post('/api/food-logs/voice', async (req, res) => {
@@ -2547,6 +2528,8 @@ app.delete('/api/user-plans/:planId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+require('./foodSearchRoutes')(app, supabase);
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
