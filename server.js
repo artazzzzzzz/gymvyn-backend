@@ -2488,6 +2488,66 @@ app.post('/api/workout/finish', async (req, res) => {
 
 require('./trainerRoutes')(app, supabase);
 
+// ── User workout plans ──────────────────────────────────
+app.get('/api/user-plans/:userId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('user_workout_plans')
+      .select('*')
+      .eq('user_id', req.params.userId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/user-plans', async (req, res) => {
+  try {
+    const { userId, name, description, planData } = req.body;
+    if (!userId || !name) return res.status(400).json({ error: 'userId and name required' });
+    const { data, error } = await supabase
+      .from('user_workout_plans')
+      .insert({ user_id: userId, name, description: description || '', plan_data: planData || {} })
+      .select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/user-plans/:planId', async (req, res) => {
+  try {
+    const updates = { ...req.body, updated_at: new Date().toISOString() };
+    delete updates.user_id;
+    const { data, error } = await supabase
+      .from('user_workout_plans')
+      .update(updates)
+      .eq('id', req.params.planId)
+      .select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/user-plans/:planId', async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('user_workout_plans')
+      .update({ is_active: false })
+      .eq('id', req.params.planId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
   console.log('Diet redesign routes registered:');
