@@ -323,16 +323,12 @@ module.exports = function (app, supabase) {
   // GET /api/trainer/my-trainer/:clientId — client gets their trainer info
   app.get('/api/trainer/my-trainer/:clientId', async (req, res) => {
     try {
-      const { data, error } = await supabase
+      const { data: rel, error } = await supabase
         .from('trainer_clients')
         .select(`
           *,
           trainer:users!trainer_clients_trainer_id_fkey(
             id, full_name
-          ),
-          trainer_profile:trainer_profiles!inner(
-            bio, specializations, experience_years, 
-            profile_photo_url, is_independent, city
           )
         `)
         .eq('client_id', req.params.clientId)
@@ -340,7 +336,16 @@ module.exports = function (app, supabase) {
         .single();
 
       if (error && error.code !== 'PGRST116') throw error;
-      res.json(data || null);
+      if (!rel) return res.json(null);
+
+      // Fetch trainer profile separately
+      const { data: trainerProfile } = await supabase
+        .from('trainer_profiles')
+        .select('bio, specializations, experience_years, profile_photo_url, is_independent, city')
+        .eq('user_id', rel.trainer_id)
+        .single();
+
+      res.json({ ...rel, trainer_profile: trainerProfile || null });
     } catch (err) {
       console.error('My trainer error:', err);
       res.status(500).json({ error: err.message });
