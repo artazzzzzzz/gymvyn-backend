@@ -523,9 +523,13 @@ module.exports = function (app, supabase) {
 
         await supabase.from('conversations').update({
           last_message_at: new Date().toISOString(),
-          last_message_preview: `New ${type} plan: ${name}`,
-          client_unread: supabase.sql`client_unread + 1`
+          last_message_preview: `New ${type} plan: ${name}`
         }).eq('id', convo.id);
+
+        await supabase.rpc('increment_unread', {
+          convo_id: convo.id,
+          field_name: 'client_unread'
+        });
       }
 
       res.json(data);
