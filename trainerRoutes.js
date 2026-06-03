@@ -439,6 +439,26 @@ module.exports = function (app, supabase) {
         .single();
 
       if (error) throw error;
+
+      // Sync all active assigned_plans that use this template
+      const { data: activePlans } = await supabase
+        .from('assigned_plans')
+        .select('id')
+        .eq('template_id', req.params.templateId)
+        .eq('status', 'active');
+
+      if (activePlans?.length) {
+        await supabase
+          .from('assigned_plans')
+          .update({
+            plan_data: updates.template_data || updates.templateData,
+            name: updates.name,
+            updated_at: new Date().toISOString()
+          })
+          .eq('template_id', req.params.templateId)
+          .eq('status', 'active');
+      }
+
       res.json(data);
     } catch (err) {
       res.status(500).json({ error: err.message });
