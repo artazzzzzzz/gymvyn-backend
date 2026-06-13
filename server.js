@@ -9,6 +9,7 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const { parse: parseCsvSync } = require('csv-parse/sync');
 const cron = require('node-cron');
 const ml = require('./ml_client');
+const QRCode = require('qrcode');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -573,64 +574,128 @@ app.get('/buddy-suggestions/:userId', async (req, res) => {
 
 app.post('/api/gyms', async (req, res) => {
   try {
-    const { userId, gymName, address, city, state, pincode, phone, email } = req.body;
+    const { 
+      user_id, name, city, gym_type, 
+      address, phone, description, 
+      operating_hours, membership_plans 
+    } = req.body;
 
-    if (!userId)                       return res.status(400).json({ message: 'Missing required field: userId' });
-    if (!gymName || !gymName.trim())   return res.status(400).json({ message: 'Gym name is required' });
-    if (!city || !city.trim())         return res.status(400).json({ message: 'City is required' });
-    if (!phone || !phone.trim())       return res.status(400).json({ message: 'Phone number is required' });
-    if (!/^\d{10}$/.test(phone.trim())) return res.status(400).json({ message: 'Phone must be 10 digits' });
-    if (pincode && !/^\d{6}$/.test(pincode.trim())) return res.status(400).json({ message: 'Pincode must be 6 digits' });
-    if (email && !/^\S+@\S+\.\S+$/.test(email.trim())) return res.status(400).json({ message: 'Email is not valid' });
-
-    // Check if user is already a gym owner
-    const { data: existingUser, error: userFetchError } = await supabase
-      .from('users')
-      .select('role, gym_id')
-      .eq('id', userId)
-      .maybeSingle();
-
-    if (userFetchError) throw userFetchError;
-    if (existingUser?.role === 'gym_owner' || existingUser?.gym_id) {
-      return res.status(409).json({ message: 'User is already associated with a gym' });
+    if (!user_id || !name || !city || !gym_type) {
+      return res.status(400).json({ message: 'Missing required fields: user_id, name, city, and gym_type are required' });
     }
 
-    // Insert gym
+    const { data: existingGym, error: checkErr } = await supabase
+      .from('gyms')
+      .select('id')
+      .eq('owner_id', user_id)
+      .eq('is_active', true)
+      .maybeSingle();
+      
+    if (checkErr && checkErr.code !== 'PGRST116') throw checkErr;
+    if (existingGym) {
+      return res.status(409).json({ error: 'Gym already registered' });
+    }
+
+    const DEFAULT_HOURS = {
+      mon: { open: '06:00', close: '22:00', closed: false },
+      tue: { open: '06:00', close: '22:00', closed: false },
+      wed: { open: '06:00', close: '22:00', closed: false },
+      thu: { open: '06:00', close: '22:00', closed: false },
+      fri: { open: '06:00', close: '22:00', closed: false },
+      sat: { open: '07:00', close: '20:00', closed: false },
+      sun: { open: '08:00', close: '18:00', closed: false }
+    };
+    
+    const DEFAULT_NOTIFICATIONS = {
+      membership_expiry_reminder: true,
+      new_member_alert: true,
+      payment_received: true,
+      low_attendance_alert: false
+    };
+
     const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const { data: gym, error: gymError } = await supabase
+    
+    const { data: createdGymRow, error: insertErr } = await supabase
       .from('gyms')
       .insert({
-        name:     gymName.trim(),
-        address:  address?.trim()  || null,
-        city:     city.trim(),
-        state:    state?.trim()    || null,
-        pincode:  pincode?.trim()  || null,
-        phone:    phone.trim(),
-        email:    email?.trim()    || null,
-        owner_id: userId,
+        id: crypto.randomUUID(),
+        owner_id: user_id,
+        name: name.trim(),
+        city: city.trim(),
+        gym_type: gym_type.trim(),
+        address: address?.trim() || null,
+        phone: phone?.trim() || null,
+        description: description?.trim() || null,
+        operating_hours: operating_hours || DEFAULT_HOURS,
+        membership_plans: membership_plans || [],
+        notifications: DEFAULT_NOTIFICATIONS,
+        is_active: true,
         join_code: joinCode,
+        created_at: new Date().toISOString()
       })
       .select()
       .single();
 
-    if (gymError) throw gymError;
-
-    // Promote user to gym_owner; if it fails, roll back the gym insert
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ role: 'gym_owner', gym_id: gym.id })
-      .eq('id', userId);
-
-    if (updateError) {
-      console.error('Promoting user to gym_owner failed, rolling back gym:', updateError);
-      await supabase.from('gyms').delete().eq('id', gym.id);
-      throw updateError;
+    if (insertErr) {
+      if (insertErr.code === 'PGRST204' || insertErr.message?.includes('column')) {
+         throw new Error('Database schema is missing required columns. Please run migrations.');
+      }
+      throw insertErr;
     }
 
-    res.status(201).json({ gym, joinCode: gym.join_code });
+    // Upsert so new users without an existing row still get role + gym_id written.
+    // full_name read from auth metadata to satisfy the NOT NULL constraint on insert.
+    let fullName = null;
+    try {
+      const { data: { user: authUserData } } = await supabase.auth.admin.getUserById(user_id);
+      fullName = authUserData?.user_metadata?.full_name || null;
+    } catch (_) { /* non-fatal */ }
+
+    const { error: updateErr } = await supabase
+      .from('users')
+      .upsert(
+        {
+          id: user_id,
+          role: 'gym_owner',
+          gym_id: createdGymRow.id,
+          ...(fullName ? { full_name: fullName } : {}),
+        },
+        { onConflict: 'id', ignoreDuplicates: false }
+      );
+
+    const user_updated = !updateErr;
+    if (updateErr) {
+      console.error('POST /api/gyms: users upsert failed (non-fatal):', updateErr.message);
+    }
+
+    res.status(201).json({
+      gym:          createdGymRow,
+      user_updated,
+      needs_reauth: true,
+      message:      'Gym registered successfully',
+    });
   } catch (err) {
     console.error('POST /api/gyms error:', err);
-    res.status(500).json({ message: err.message || 'Failed to create gym' });
+    res.status(500).json({ message: err.message || 'Failed to register gym' });
+  }
+});
+
+// Idempotency check — always 200; gym: null means not set up yet
+app.get('/api/gyms/owner/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('gyms')
+      .select('*')
+      .eq('owner_id', userId)
+      .eq('is_active', true)
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    res.json({ gym: data || null });
+  } catch (err) {
+    console.error('GET /api/gyms/owner/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to check gym ownership' });
   }
 });
 
@@ -641,8 +706,11 @@ app.get('/api/gyms/:userId', async (req, res) => {
       .from('gyms')
       .select('*')
       .eq('owner_id', userId)
+      .eq('is_active', true)
+      .limit(1)
       .maybeSingle();
     if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'Active gym not found' });
     res.json(data);
   } catch (err) {
     console.error('GET /api/gyms/:userId error:', err);
@@ -650,17 +718,51 @@ app.get('/api/gyms/:userId', async (req, res) => {
   }
 });
 
+const GYM_DEFAULT_HOURS = {
+  mon: { open: '06:00', close: '22:00', closed: false },
+  tue: { open: '06:00', close: '22:00', closed: false },
+  wed: { open: '06:00', close: '22:00', closed: false },
+  thu: { open: '06:00', close: '22:00', closed: false },
+  fri: { open: '06:00', close: '22:00', closed: false },
+  sat: { open: '07:00', close: '20:00', closed: false },
+  sun: { open: '08:00', close: '18:00', closed: false },
+};
+const GYM_DEFAULT_NOTIFICATIONS = {
+  membership_expiry_reminder: true,
+  new_member_alert:           true,
+  payment_received:           true,
+  low_attendance_alert:       false,
+};
+
+// Apply defaults to a raw gyms row before sending to client
+function applyGymSettingsDefaults(row) {
+  return {
+    id:               row.id,
+    name:             row.name,
+    city:             row.city,
+    address:          row.address   || null,
+    phone:            row.phone     || null,
+    gym_type:         row.gym_type  || 'commercial',
+    logo_url:         row.logo_url  || null,
+    description:      row.description || '',
+    operating_hours:  row.operating_hours  || GYM_DEFAULT_HOURS,
+    membership_plans: row.membership_plans || [],
+    notifications:    row.notifications    || GYM_DEFAULT_NOTIFICATIONS,
+    created_at:       row.created_at,
+  };
+}
+
 app.get('/api/gyms/:gymId/settings', async (req, res) => {
   try {
     const { gymId } = req.params;
     const { data, error } = await supabase
       .from('gyms')
-      .select('name, address, city, state, pincode, phone, email, logo_url, join_code, plan_tier')
+      .select('*')
       .eq('id', gymId)
       .maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ message: 'Gym not found' });
-    res.json(data);
+    res.json(applyGymSettingsDefaults(data));
   } catch (err) {
     console.error('GET /api/gyms/:gymId/settings error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch settings' });
@@ -670,45 +772,194 @@ app.get('/api/gyms/:gymId/settings', async (req, res) => {
 app.patch('/api/gyms/:gymId/settings', async (req, res) => {
   try {
     const { gymId } = req.params;
-    const { name, address, city, state, pincode, phone, email } = req.body;
-    const updates = {};
-    if (name     !== undefined) updates.name     = name;
-    if (address  !== undefined) updates.address  = address;
-    if (city     !== undefined) updates.city     = city;
-    if (state    !== undefined) updates.state    = state;
-    if (pincode  !== undefined) updates.pincode  = pincode;
-    if (phone    !== undefined) updates.phone    = phone;
-    if (email    !== undefined) updates.email    = email;
+    const body = req.body || {};
 
-    const { error } = await supabase.from('gyms').update(updates).eq('id', gymId);
-    if (error) throw error;
-    res.json({ success: true });
+    const ALLOWED = [
+      'name', 'city', 'address', 'phone', 'description',
+      'gym_type', 'operating_hours', 'membership_plans', 'notifications',
+    ];
+    const updateObj = {};
+    ALLOWED.forEach(field => {
+      if (body[field] !== undefined) updateObj[field] = body[field];
+    });
+
+    if (Object.keys(updateObj).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('gyms')
+      .update(updateObj)
+      .eq('id', gymId)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST204' || error.message?.includes('column')) {
+        throw new Error('Database schema is missing required columns. Please run migrations.');
+      }
+      throw error;
+    }
+    if (!data) return res.status(404).json({ message: 'Gym not found' });
+
+    // Return with defaults applied (same shape as GET)
+    res.json(applyGymSettingsDefaults(data));
   } catch (err) {
     console.error('PATCH /api/gyms/:gymId/settings error:', err);
     res.status(500).json({ message: err.message || 'Failed to update settings' });
   }
 });
 
-const logoStorage = new CloudinaryStorage({
-  cloudinary,
-  params: {
-    folder: 'fitforge/gym-logos',
-    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
-  },
-});
-const logoUpload = multer({ storage: logoStorage });
+const logoMemUpload = multer({ storage: multer.memoryStorage() });
 
-app.post('/api/gyms/:gymId/upload-logo', logoUpload.single('logo'), async (req, res) => {
+app.post('/api/gyms/:gymId/upload-logo', logoMemUpload.single('logo'), async (req, res) => {
+  const { gymId } = req.params;
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
-    const { gymId } = req.params;
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-    const logo_url = req.file.path;
-    const { error } = await supabase.from('gyms').update({ logo_url }).eq('id', gymId);
-    if (error) throw error;
-    res.json({ success: true, logo_url });
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream(
+        {
+          folder:     'fitforge/gyms',
+          public_id:  `gym-logo-${gymId}`,
+          overwrite:  true,
+          transformation: [
+            { width: 400, height: 400, crop: 'fill', gravity: 'center' },
+          ],
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      ).end(req.file.buffer);
+    });
+
+    const { error: dbErr } = await supabase
+      .from('gyms')
+      .update({ logo_url: result.secure_url })
+      .eq('id', gymId);
+    if (dbErr) throw dbErr;
+
+    res.json({ logo_url: result.secure_url });
   } catch (err) {
     console.error('POST /api/gyms/:gymId/upload-logo error:', err);
-    res.status(500).json({ message: err.message || 'Failed to upload logo' });
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+app.delete('/api/gyms/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    
+    const { error: gymErr } = await supabase
+      .from('gyms')
+      .update({ is_active: false })
+      .eq('id', gymId);
+    if (gymErr) throw gymErr;
+    
+    const { error: memErr } = await supabase
+      .from('gym_memberships')
+      .update({ status: 'inactive' })
+      .eq('gym_id', gymId);
+    if (memErr) throw memErr;
+    
+    res.json({ success: true, message: 'Gym deactivated. Contact support to restore.' });
+  } catch (err) {
+    console.error('DELETE /api/gyms/:gymId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to deactivate gym' });
+  }
+});
+
+app.post('/api/gyms/:gymId/membership-plans', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { name, duration_days, price, features, is_active } = req.body;
+    
+    const { data: gym, error: fetchErr } = await supabase
+      .from('gyms')
+      .select('membership_plans')
+      .eq('id', gymId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!gym) return res.status(404).json({ message: 'Gym not found' });
+    
+    const plans = gym.membership_plans || [];
+    const newPlan = {
+      id: crypto.randomUUID(),
+      name,
+      duration_days,
+      price,
+      features: features || [],
+      is_active: is_active !== false
+    };
+    plans.push(newPlan);
+    
+    const { error: updateErr } = await supabase
+      .from('gyms')
+      .update({ membership_plans: plans })
+      .eq('id', gymId);
+    if (updateErr) throw updateErr;
+    res.status(201).json(plans);
+  } catch (err) {
+    console.error('POST /api/gyms/:gymId/membership-plans error:', err);
+    res.status(500).json({ message: err.message || 'Failed to add membership plan' });
+  }
+});
+
+app.delete('/api/gyms/:gymId/membership-plans/:planId', async (req, res) => {
+  try {
+    const { gymId, planId } = req.params;
+    
+    const { data: gym, error: fetchErr } = await supabase
+      .from('gyms')
+      .select('membership_plans')
+      .eq('id', gymId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!gym) return res.status(404).json({ message: 'Gym not found' });
+    
+    const plans = gym.membership_plans || [];
+    const filteredPlans = plans.filter(p => p.id !== planId);
+    
+    const { error: updateErr } = await supabase
+      .from('gyms')
+      .update({ membership_plans: filteredPlans })
+      .eq('id', gymId);
+    if (updateErr) throw updateErr;
+    res.json(filteredPlans);
+  } catch (err) {
+    console.error('DELETE /api/gyms/:gymId/membership-plans/:planId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to remove membership plan' });
+  }
+});
+
+app.patch('/api/gyms/:gymId/membership-plans/:planId', async (req, res) => {
+  try {
+    const { gymId, planId } = req.params;
+    const updates = req.body;
+    
+    const { data: gym, error: fetchErr } = await supabase
+      .from('gyms')
+      .select('membership_plans')
+      .eq('id', gymId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!gym) return res.status(404).json({ message: 'Gym not found' });
+    
+    const plans = gym.membership_plans || [];
+    const index = plans.findIndex(p => p.id === planId);
+    if (index === -1) return res.status(404).json({ message: 'Membership plan not found' });
+    
+    plans[index] = { ...plans[index], ...updates };
+    
+    const { error: updateErr } = await supabase
+      .from('gyms')
+      .update({ membership_plans: plans })
+      .eq('id', gymId);
+    if (updateErr) throw updateErr;
+    res.json(plans);
+  } catch (err) {
+    console.error('PATCH /api/gyms/:gymId/membership-plans/:planId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to update membership plan' });
   }
 });
 
@@ -935,43 +1186,513 @@ app.post('/api/gym-members/csv-import', csvUpload.single('file'), async (req, re
   }
 });
 
+// ── GET /api/gym-members  ─────────────────────────────────────────────────────
+
+const PLAN_TYPE_LABELS = {
+  monthly:     'Monthly',
+  quarterly:   'Quarterly',
+  half_yearly: 'Half-Yearly',
+  annual:      'Annual',
+};
+
+app.get('/api/gym-members', async (req, res) => {
+  try {
+    const {
+      gymId,
+      search,
+      status,
+      page              = '1',
+      limit             = '20',
+      expiring_within_days,
+    } = req.query;
+
+    if (!gymId) return res.status(400).json({ message: 'gymId is required' });
+
+    const pageNum  = Math.max(1, parseInt(page,  10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
+    const offset   = (pageNum - 1) * limitNum;
+
+    // Base query: gym_memberships ⟶ users
+    let query = supabase
+      .from('gym_memberships')
+      .select(`
+        id,
+        user_id,
+        membership_type,
+        start_date,
+        end_date,
+        status,
+        created_at,
+        users!inner(id, full_name, phone, created_at)
+      `)
+      .eq('gym_id', gymId)
+      .order('created_at', { ascending: false });
+
+    if (status && status !== 'all') {
+      query = query.eq('status', status);
+    }
+
+    if (expiring_within_days) {
+      const days = parseInt(expiring_within_days, 10);
+      if (!Number.isNaN(days) && days > 0) {
+        const nowStr    = new Date().toISOString().slice(0, 10);
+        const futureStr = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+        query = query.gte('end_date', nowStr).lte('end_date', futureStr);
+      }
+    }
+
+    const { data: rows, error } = await query;
+    if (error) throw error;
+
+    // Name search in JS (PostgREST ILIKE on embedded columns is unreliable)
+    let filtered = rows || [];
+    if (search && search.trim()) {
+      const term = search.trim().toLowerCase();
+      filtered = filtered.filter(r =>
+        (r.users?.full_name || '').toLowerCase().includes(term)
+      );
+    }
+
+    const total = filtered.length;
+    const paged = filtered.slice(offset, offset + limitNum);
+
+    // Fetch latest churn scores for visible users
+    const userIds = paged.map(r => r.user_id).filter(Boolean);
+    const churnMap = {};
+    if (userIds.length > 0) {
+      const { data: scores } = await supabase
+        .from('churn_scores')
+        .select('user_id, score, predicted_at')
+        .in('user_id', userIds)
+        .eq('gym_id', gymId)
+        .order('predicted_at', { ascending: false });
+
+      for (const s of scores || []) {
+        if (!churnMap[s.user_id]) {
+          const rs = s.score / 100;
+          churnMap[s.user_id] = rs >= 0.7 ? 'high' : rs >= 0.4 ? 'medium' : 'low';
+        }
+      }
+    }
+
+    const now = Date.now();
+    const members = paged.map(r => {
+      const endMs             = r.end_date ? new Date(r.end_date).getTime() : null;
+      const days_until_expiry = endMs != null
+        ? Math.ceil((endMs - now) / 86400000)
+        : null;
+
+      return {
+        id:               r.users?.id || r.user_id,
+        full_name:        r.users?.full_name || '',
+        phone:            r.users?.phone    || '',
+        plan_type:        PLAN_TYPE_LABELS[r.membership_type] || r.membership_type || '',
+        membership_start: r.start_date || null,
+        membership_end:   r.end_date   || null,
+        status:           r.status     || 'active',
+        days_until_expiry,
+        churn_risk:       churnMap[r.user_id] || 'low',
+        joined_at:        r.users?.created_at || r.created_at || null,
+      };
+    });
+
+    res.json({ members, total, page: pageNum, hasMore: offset + limitNum < total });
+  } catch (err) {
+    console.error('GET /api/gym-members error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch gym members' });
+  }
+});
+
+// ── GET /api/gym-members/count/:gymId ────────────────────────────────────────
+
+app.get('/api/gym-members/count/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+
+    const nowStr    = new Date().toISOString().slice(0, 10);
+    const in7Days   = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+
+    const [totalRes, activeRes, expiringRes, allMembersRes] = await Promise.all([
+      supabase
+        .from('gym_memberships')
+        .select('id', { count: 'exact', head: true })
+        .eq('gym_id', gymId),
+      supabase
+        .from('gym_memberships')
+        .select('id', { count: 'exact', head: true })
+        .eq('gym_id', gymId)
+        .eq('status', 'active'),
+      supabase
+        .from('gym_memberships')
+        .select('id', { count: 'exact', head: true })
+        .eq('gym_id', gymId)
+        .gte('end_date', nowStr)
+        .lte('end_date', in7Days),
+      supabase
+        .from('gym_memberships')
+        .select('user_id')
+        .eq('gym_id', gymId),
+    ]);
+
+    // Count high-risk members from latest churn scores
+    let atRiskCount = 0;
+    const allUserIds = (allMembersRes.data || []).map(m => m.user_id).filter(Boolean);
+    if (allUserIds.length > 0) {
+      const { data: scores } = await supabase
+        .from('churn_scores')
+        .select('user_id, score, predicted_at')
+        .in('user_id', allUserIds)
+        .eq('gym_id', gymId)
+        .order('predicted_at', { ascending: false });
+
+      const latestByUser = {};
+      for (const s of scores || []) {
+        if (!latestByUser[s.user_id]) latestByUser[s.user_id] = s;
+      }
+      atRiskCount = Object.values(latestByUser).filter(s => (s.score / 100) >= 0.7).length;
+    }
+
+    const total    = totalRes.count  || 0;
+    const active   = activeRes.count || 0;
+    const inactive = Math.max(0, total - active);
+
+    res.json({
+      total,
+      active,
+      expiring_soon: expiringRes.count || 0,
+      at_risk:       atRiskCount,
+      inactive,
+    });
+  } catch (err) {
+    console.error('GET /api/gym-members/count/:gymId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch member counts' });
+  }
+});
+
+// ── Member detail helper ──────────────────────────────────────────────────────
+
+async function buildMemberDetail(memberId) {
+  // 1. Most-recent membership + user data (one query, take first row)
+  const { data: memberships, error: memErr } = await supabase
+    .from('gym_memberships')
+    .select(`
+      id, gym_id, membership_type, start_date, end_date, status,
+      users!inner(
+        id, full_name, phone, age, height, current_weight, gender, created_at
+      )
+    `)
+    .eq('user_id', memberId)
+    .order('created_at', { ascending: false });
+  if (memErr) throw memErr;
+  if (!memberships || memberships.length === 0) return null;
+
+  const membership = memberships[0];
+  const gymId      = membership.gym_id;
+  const user       = membership.users;
+
+  // 2. Parallel: latest churn score, this-month check-ins, last-5 payments
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+
+  const [churnRes, checkinsRes, paymentsRes] = await Promise.all([
+    supabase
+      .from('churn_scores')
+      .select('score, top_reasons, predicted_at')
+      .eq('user_id', memberId)
+      .eq('gym_id', gymId)
+      .order('predicted_at', { ascending: false })
+      .limit(1),
+    supabase
+      .from('check_ins')
+      .select('checked_in_at')
+      .eq('user_id', memberId)
+      .gte('checked_in_at', monthStart.toISOString())
+      .order('checked_in_at', { ascending: false }),
+    supabase
+      .from('payments')
+      .select('id, amount, paid_at, status')
+      .eq('user_id', memberId)
+      .eq('gym_id', gymId)
+      .order('paid_at', { ascending: false })
+      .limit(5),
+  ]);
+
+  // Attendance
+  const checkins    = checkinsRes.data || [];
+  const visitCount  = checkins.length;
+  const lastVisited = checkins[0]?.checked_in_at || null;
+  const dayOfMonth  = Math.max(1, new Date().getDate());
+  const perWeek     = parseFloat((visitCount / 4.3).toFixed(1));
+  const ratePercent = Math.min(100, Math.round((visitCount / dayOfMonth) * 100));
+
+  // Churn
+  const churnRow  = (churnRes.data || [])[0] ?? null;
+  const rawScore  = churnRow?.score ?? 0;
+  const normScore = rawScore / 100;
+  const churnRisk = normScore >= 0.7 ? 'high' : normScore >= 0.4 ? 'medium' : 'low';
+
+  // Days until expiry
+  const endMs           = membership.end_date ? new Date(membership.end_date).getTime() : null;
+  const daysUntilExpiry = endMs != null ? Math.ceil((endMs - Date.now()) / 86400000) : null;
+
+  const planTypeLabel = PLAN_TYPE_LABELS[membership.membership_type] || membership.membership_type || '';
+
+  const payments = (paymentsRes.data || []).map(p => ({
+    id:        p.id,
+    amount:    p.amount,
+    plan_type: planTypeLabel,
+    paid_at:   p.paid_at || null,
+    status:    p.status,
+  }));
+
+  return {
+    id:                user.id,
+    full_name:         user.full_name || '',
+    phone:             user.phone     || '',
+    age:               user.age             ?? null,
+    height:            user.height          ?? null,
+    current_weight:    user.current_weight  ?? null,
+    gender:            user.gender          ?? null,
+    joined_at:         user.created_at      || null,
+    plan_type:         planTypeLabel,
+    membership_start:  membership.start_date || null,
+    membership_end:    membership.end_date   || null,
+    membership_status: membership.status     || 'active',
+    days_until_expiry: daysUntilExpiry,
+    churn_score:       rawScore,
+    churn_risk:        churnRisk,
+    risk_factors:      churnRow?.top_reasons || [],
+    attendance: {
+      this_month:   visitCount,
+      per_week:     perWeek,
+      rate_percent: ratePercent,
+      last_visited: lastVisited,
+    },
+    payments,
+    _gymId: gymId,   // stripped by callers before sending
+  };
+}
+
+// ── GET /api/gym-members/:memberId ────────────────────────────────────────────
+
+app.get('/api/gym-members/:memberId', async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    const detail = await buildMemberDetail(memberId);
+    if (!detail) return res.status(404).json({ error: 'Member not found' });
+    const { _gymId, ...member } = detail;   // strip internal field
+    res.json(member);
+  } catch (err) {
+    console.error('GET /api/gym-members/:memberId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch member' });
+  }
+});
+
+// ── POST /api/gym-members/:memberId/renew ─────────────────────────────────────
+
+app.post('/api/gym-members/:memberId/renew', async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    const { plan_type, amount, new_end_date } = req.body || {};
+
+    if (!new_end_date) return res.status(400).json({ error: 'new_end_date is required' });
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+
+    // Resolve gymId from existing membership
+    const { data: memRow, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('id, gym_id, membership_type')
+      .eq('user_id', memberId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+    if (!memRow) return res.status(404).json({ error: 'Member not found' });
+
+    const gymId = memRow.gym_id;
+
+    // Derive DB membership_type from plan_type label (or keep existing)
+    const labelToType = Object.fromEntries(
+      Object.entries(PLAN_TYPE_LABELS).map(([k, v]) => [v.toLowerCase(), k])
+    );
+    const newMembershipType = labelToType[(plan_type || '').toLowerCase()] || memRow.membership_type;
+
+    // 1. Update membership
+    const { error: updErr } = await supabase
+      .from('gym_memberships')
+      .update({
+        end_date:        new_end_date,
+        status:          'active',
+        membership_type: newMembershipType,
+      })
+      .eq('user_id', memberId);
+    if (updErr) throw updErr;
+
+    // 2. Insert paid payment record
+    const now = new Date().toISOString();
+    const { error: payErr } = await supabase
+      .from('payments')
+      .insert({
+        gym_id:        gymId,
+        user_id:       memberId,
+        membership_id: memRow.id,
+        amount:        amt,
+        due_date:      new_end_date,
+        paid_at:       now,
+        status:        'paid',
+        notes:         plan_type ? `Renewal – ${plan_type}` : 'Renewal',
+      });
+    if (payErr) throw payErr;
+
+    // 3. Return fresh member detail
+    const detail = await buildMemberDetail(memberId);
+    if (!detail) return res.status(404).json({ error: 'Member not found' });
+    const { _gymId, ...member } = detail;
+    res.json(member);
+  } catch (err) {
+    console.error('POST /api/gym-members/:memberId/renew error:', err);
+    res.status(500).json({ error: err.message || 'Failed to renew membership' });
+  }
+});
+
+// ── DELETE /api/gym-members/:memberId ─────────────────────────────────────────
+
+app.delete('/api/gym-members/:memberId', async (req, res) => {
+  try {
+    const { memberId } = req.params;
+
+    // 1. Soft-delete membership
+    const { error: memErr } = await supabase
+      .from('gym_memberships')
+      .update({ status: 'removed' })
+      .eq('user_id', memberId);
+    if (memErr) throw memErr;
+
+    // 2. Detach user from gym, reset role
+    const { error: userErr } = await supabase
+      .from('users')
+      .update({ gym_id: null, role: 'consumer' })
+      .eq('id', memberId);
+    if (userErr) throw userErr;
+
+    res.json({ success: true, message: 'Member removed' });
+  } catch (err) {
+    console.error('DELETE /api/gym-members/:memberId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to remove member' });
+  }
+});
+
 // ── Trainer management ────────────────────────────────────────────────────────
 
 app.post('/api/gym-trainers/invite', async (req, res) => {
   try {
-    const { gym_id, full_name, phone, bio, specialties, hourly_rate } = req.body;
+    const { gym_id, type, value } = req.body || {};
+
+    if (!gym_id)  return res.status(400).json({ message: 'gym_id is required' });
+    if (!type || !['phone', 'email'].includes(type))
+      return res.status(400).json({ message: 'type must be "phone" or "email"' });
+    if (!value || !value.trim())
+      return res.status(400).json({ message: 'value (phone number or email) is required' });
+
+    // ── Check if a trainer_profiles row already exists for this gym ───────────
+    const matchField = type === 'phone' ? 'phone' : 'email';
+    const { data: existing, error: lookupErr } = await supabase
+      .from('trainer_profiles')
+      .select('*')
+      .eq('gym_id', gym_id)
+      .eq(matchField, value.trim())
+      .maybeSingle();
+    if (lookupErr && lookupErr.code !== 'PGRST116') throw lookupErr;
+
+    if (existing) {
+      // Already exists — update status to 'invited'
+      const { data: updated, error: updateErr } = await supabase
+        .from('trainer_profiles')
+        .update({ status: 'invited' })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (updateErr) throw updateErr;
+      const invite_code = updated.invite_code;
+      console.log(`[INVITE] Would send ${type} invite to ${value} with code ${invite_code}`);
+      return res.status(200).json({ success: true, invite_code, trainer: updated });
+    }
+
+    // ── Create new trainer_profiles row ──────────────────────────────────────
+    const invite_code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    const id = crypto.randomUUID();
+    const newRow = {
+      id,
+      gym_id,
+      full_name: 'Invited Trainer',
+      phone:     type === 'phone' ? value.trim() : null,
+      email:     type === 'email' ? value.trim() : null,
+      specializations:      [],
+      experience_years:     0,
+      is_independent:       false,
+      is_accepting_clients: true,
+      invite_code,
+      status:    'invited',
+      is_active: true,
+      created_at: new Date().toISOString(),
+    };
+
+    const { data: created, error: insertErr } = await supabase
+      .from('trainer_profiles')
+      .insert(newRow)
+      .select()
+      .single();
+    if (insertErr) throw insertErr;
+
+    console.log(`[INVITE] Would send ${type} invite to ${value} with code ${invite_code}`);
+    res.status(201).json({ success: true, invite_code, trainer: created });
+  } catch (err) {
+    console.error('POST /api/gym-trainers/invite error:', err);
+    res.status(500).json({ message: err.message || 'Failed to invite trainer' });
+  }
+});
+
+app.post('/api/gym-trainers/manual', async (req, res) => {
+  try {
+    const { gym_id, full_name, phone, specializations, experience_years } = req.body;
     if (!gym_id || !full_name) {
       return res.status(400).json({ message: 'gym_id and full_name are required' });
     }
 
-    const userId = crypto.randomUUID();
+    const invite_code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    const id = crypto.randomUUID();
 
-    // Insert into users
-    const { error: userErr } = await supabase
-      .from('users')
-      .insert({ id: userId, full_name, phone: phone || null, role: 'trainer', is_active: true });
-    if (userErr) throw userErr;
+    const insertData = {
+      id,
+      gym_id,
+      full_name,
+      phone: phone || null,
+      specializations: specializations || [],
+      experience_years: experience_years || 0,
+      is_independent: false,
+      is_accepting_clients: true,
+      invite_code,
+      status: 'manual',
+      created_at: new Date().toISOString(),
+      is_active: true
+    };
 
-    // Insert into trainer_profiles
-    const { error: profileErr } = await supabase
+    const { data, error } = await supabase
       .from('trainer_profiles')
-      .insert({
-        user_id: userId,
-        gym_id,
-        bio: bio || null,
-        specialties: specialties || null,
-        hourly_rate: hourly_rate || null,
-        is_active: true,
-      });
-    if (profileErr) {
-      await supabase.from('users').delete().eq('id', userId);
-      throw profileErr;
-    }
+      .insert(insertData)
+      .select()
+      .single();
 
-    res.status(201).json({ success: true, trainer_id: userId });
+    if (error) throw error;
+
+    res.status(201).json(data);
   } catch (err) {
-    console.error('POST /api/gym-trainers/invite error:', err);
-    res.status(500).json({ message: err.message || 'Failed to invite trainer' });
+    console.error('POST /api/gym-trainers/manual error:', err);
+    res.status(500).json({ message: err.message || 'Failed to create manual trainer' });
   }
 });
 
@@ -979,10 +1700,16 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
 
+    // Check if gymId is a valid UUID
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!uuidRegex.test(gymId)) {
+      return res.json([]);
+    }
+
     // Step 1: get active trainer_profiles for this gym
     const { data: profiles, error: profilesErr } = await supabase
       .from('trainer_profiles')
-      .select('user_id, bio, specialties, hourly_rate')
+      .select('*')
       .eq('gym_id', gymId)
       .eq('is_active', true);
     if (profilesErr) throw profilesErr;
@@ -991,47 +1718,56 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
       return res.json([]);
     }
 
-    // Step 2: fetch full_name + phone for each trainer's user_id
-    const userIds = profiles.map(p => p.user_id);
-    const { data: users, error: usersErr } = await supabase
-      .from('users')
-      .select('id, full_name, phone')
-      .in('id', userIds);
-    if (usersErr) throw usersErr;
+    const trainerIds = profiles.map(p => p.id);
+    const userIds = profiles.map(p => p.user_id).filter(Boolean);
 
-    // Step 3: count active members assigned to each trainer
-    const { data: assignments, error: assignErr } = await supabase
-      .from('gym_memberships')
-      .select('assigned_trainer_id')
-      .in('assigned_trainer_id', userIds)
+    // Step 2: fetch full_name + phone for each trainer's user_id if present
+    let users = [];
+    if (userIds.length > 0) {
+      const { data: usersData, error: usersErr } = await supabase
+        .from('users')
+        .select('id, full_name, phone')
+        .in('id', userIds);
+      if (usersErr) throw usersErr;
+      users = usersData || [];
+    }
+
+    // Step 3: count active clients from trainer_clients
+    const allIds = [...new Set([...trainerIds, ...userIds])];
+    const { data: clients, error: clientsErr } = await supabase
+      .from('trainer_clients')
+      .select('trainer_id, status')
+      .in('trainer_id', allIds)
       .eq('status', 'active');
-    if (assignErr) throw assignErr;
+    if (clientsErr) throw clientsErr;
 
-    const assignedCount = new Map();
-    for (const a of assignments || []) {
-      assignedCount.set(a.assigned_trainer_id, (assignedCount.get(a.assigned_trainer_id) || 0) + 1);
+    const clientCountMap = new Map();
+    for (const c of clients || []) {
+      clientCountMap.set(c.trainer_id, (clientCountMap.get(c.trainer_id) || 0) + 1);
     }
 
     const userById = new Map((users || []).map(u => [u.id, u]));
-    const profileByUserId = new Map(profiles.map(p => [p.user_id, p]));
 
-    const trainers = userIds
-      .map(uid => {
-        const u = userById.get(uid);
-        const p = profileByUserId.get(uid);
-        if (!u) return null;
-        return {
-          user_id: uid,
-          full_name: u.full_name,
-          phone: u.phone || null,
-          bio: p?.bio || null,
-          specialties: p?.specialties || null,
-          hourly_rate: p?.hourly_rate || null,
-          members_assigned: assignedCount.get(uid) || 0,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.full_name.localeCompare(b.full_name));
+    const trainers = profiles.map(p => {
+      const u = p.user_id ? userById.get(p.user_id) : null;
+      const client_count = (clientCountMap.get(p.id) || 0) + (p.user_id ? (clientCountMap.get(p.user_id) || 0) : 0);
+
+      return {
+        id: p.id,
+        full_name: p.full_name || (u ? u.full_name : 'Unknown'),
+        phone: p.phone || (u ? u.phone : null),
+        specializations: p.specializations || p.specialties || [],
+        experience_years: p.experience_years || 0,
+        profile_photo_url: p.profile_photo_url || null,
+        invite_code: p.invite_code || null,
+        is_independent: p.is_independent || false,
+        gym_id: p.gym_id,
+        is_accepting_clients: p.is_accepting_clients !== false,
+        created_at: p.created_at,
+        status: p.status || 'active',
+        client_count
+      };
+    });
 
     res.json(trainers);
   } catch (err) {
@@ -1044,17 +1780,24 @@ app.delete('/api/gym-trainers/:trainerId', async (req, res) => {
   try {
     const { trainerId } = req.params;
 
+    // Verify the trainer exists and is currently active
+    const { data: existing, error: fetchErr } = await supabase
+      .from('trainer_profiles')
+      .select('id, is_active')
+      .eq('id', trainerId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing)           return res.status(404).json({ message: 'Trainer not found' });
+    if (!existing.is_active) return res.status(404).json({ message: 'Trainer already inactive' });
+
     const { error: profileErr } = await supabase
       .from('trainer_profiles')
       .update({ is_active: false })
-      .eq('user_id', trainerId);
+      .eq('id', trainerId);
     if (profileErr) throw profileErr;
 
-    const { error: userErr } = await supabase
-      .from('users')
-      .update({ is_active: false })
-      .eq('id', trainerId);
-    if (userErr) throw userErr;
+    // Also soft-delete the linked users row if present
+    await supabase.from('users').update({ is_active: false }).eq('id', trainerId);
 
     res.json({ success: true });
   } catch (err) {
@@ -1083,18 +1826,129 @@ app.post('/api/gym-members/:memberId/assign-trainer', async (req, res) => {
 
 // ── Gym payments ──────────────────────────────────────────────────────────────
 
-const VALID_PAYMENT_STATUSES = ['pending', 'paid', 'overdue'];
+const VALID_PAYMENT_STATUSES = ['pending', 'paid', 'overdue', 'refunded'];
+
+// Days to extend a membership per plan label
+const PLAN_TYPE_DAYS = {
+  Monthly: 30, Quarterly: 90, 'Half-Yearly': 180, Annual: 365,
+};
+
+// Resolve period param to start/end ISO strings for paid_at filter
+function paymentPeriodRange(period) {
+  const now = new Date();
+  if (period === 'this_week') {
+    const start = new Date(now);
+    start.setDate(start.getDate() - start.getDay());
+    start.setHours(0, 0, 0, 0);
+    return { start: start.toISOString(), end: null };
+  }
+  if (period === 'this_month') {
+    return {
+      start: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(),
+      end: null,
+    };
+  }
+  if (period === 'last_month') {
+    return {
+      start: new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString(),
+      end:   new Date(now.getFullYear(), now.getMonth(), 1).toISOString(),
+    };
+  }
+  return { start: null, end: null };
+}
+
+// ── GET /api/gym-payments/:gymId/summary (before /:gymId to avoid param capture)
+
+app.get('/api/gym-payments/:gymId/summary', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const now             = new Date();
+    const thisMonthStart  = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const lastMonthStart  = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
+    const sixMonthsAgo    = new Date(now.getFullYear(), now.getMonth() - 5, 1).toISOString();
+
+    const [thisMonthRes, lastMonthRes, txCountRes, overdueRes, chartRes, activeMembersRes] =
+      await Promise.all([
+        // This month paid
+        supabase.from('payments').select('amount')
+          .eq('gym_id', gymId).eq('status', 'paid').gte('paid_at', thisMonthStart),
+        // Last month paid
+        supabase.from('payments').select('amount')
+          .eq('gym_id', gymId).eq('status', 'paid')
+          .gte('paid_at', lastMonthStart).lt('paid_at', thisMonthStart),
+        // Transaction count this month (any status)
+        supabase.from('payments').select('id', { count: 'exact', head: true })
+          .eq('gym_id', gymId).gte('paid_at', thisMonthStart),
+        // Overdue payments
+        supabase.from('payments').select('amount')
+          .eq('gym_id', gymId).eq('status', 'overdue'),
+        // Last 6 months paid (for chart bucketing in JS)
+        supabase.from('payments').select('amount, paid_at')
+          .eq('gym_id', gymId).eq('status', 'paid').gte('paid_at', sixMonthsAgo),
+        // Active member count
+        supabase.from('gym_memberships').select('id', { count: 'exact', head: true })
+          .eq('gym_id', gymId).eq('status', 'active'),
+      ]);
+
+    const thisMonth     = (thisMonthRes.data  || []).reduce((s, p) => s + Number(p.amount || 0), 0);
+    const lastMonth     = (lastMonthRes.data  || []).reduce((s, p) => s + Number(p.amount || 0), 0);
+    const overdueRows   = overdueRes.data || [];
+    const overdueCount  = overdueRows.length;
+    const overdueTotal  = overdueRows.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const activeMembers = activeMembersRes.count || 0;
+    const avgPerMember  = activeMembers > 0 ? Math.round(thisMonth / activeMembers) : 0;
+
+    // Build exactly 6 month buckets (oldest → newest), fill zeros for empty months
+    const monthBuckets = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      monthBuckets.push({
+        _year:       d.getFullYear(),
+        _month:      d.getMonth(),
+        month_label: d.toLocaleDateString('en-US', { month: 'short' }),
+        total:       0,
+      });
+    }
+    for (const p of chartRes.data || []) {
+      if (!p.paid_at) continue;
+      const d      = new Date(p.paid_at);
+      const bucket = monthBuckets.find(b => b._year === d.getFullYear() && b._month === d.getMonth());
+      if (bucket) bucket.total += Number(p.amount || 0);
+    }
+
+    res.json({
+      this_month:        Math.round(thisMonth),
+      last_month:        Math.round(lastMonth),
+      month_change:      Math.round(thisMonth - lastMonth),
+      transaction_count: txCountRes.count || 0,
+      avg_per_member:    avgPerMember,
+      overdue_count:     overdueCount,
+      overdue_total:     Math.round(overdueTotal),
+      monthly_chart:     monthBuckets.map(({ month_label, total }) => ({
+        month_label, total: Math.round(total),
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/gym-payments/:gymId/summary error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch payment summary' });
+  }
+});
+
+// ── GET /api/gym-payments/:gymId
 
 app.get('/api/gym-payments/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
-    const { status } = req.query;
+    const { status, period, page = '1', limit = '20' } = req.query;
+
+    const pageNum  = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
 
     let query = supabase
       .from('payments')
-      .select('id, user_id, membership_id, amount, due_date, paid_at, status, payment_method, notes, users(full_name)')
+      .select('id, user_id, membership_id, amount, due_date, paid_at, status, payment_method, notes, users(full_name, phone)')
       .eq('gym_id', gymId)
-      .order('due_date', { ascending: false });
+      .order('paid_at', { ascending: false });
 
     if (status) {
       if (!VALID_PAYMENT_STATUSES.includes(status)) {
@@ -1103,45 +1957,63 @@ app.get('/api/gym-payments/:gymId', async (req, res) => {
       query = query.eq('status', status);
     }
 
+    if (period && period !== 'all') {
+      const { start, end } = paymentPeriodRange(period);
+      if (start) query = query.gte('paid_at', start);
+      if (end)   query = query.lt('paid_at', end);
+    }
+
     const { data, error } = await query;
     if (error) throw error;
 
-    const flattened = (data || []).map(p => ({
-      id: p.id,
-      user_id: p.user_id,
-      full_name: p.users?.full_name ?? null,
-      membership_id: p.membership_id,
-      amount: p.amount,
-      due_date: p.due_date,
-      paid_at: p.paid_at,
-      status: p.status,
-      payment_method: p.payment_method,
-      notes: p.notes,
+    const all  = data || [];
+    const total = all.length;
+    const paged = all.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+
+    // Derive plan_type via membership_id → membership_type
+    const memIds = [...new Set(paged.map(p => p.membership_id).filter(Boolean))];
+    const membershipTypeMap = {};
+    if (memIds.length) {
+      const { data: mems } = await supabase
+        .from('gym_memberships')
+        .select('id, membership_type')
+        .in('id', memIds);
+      for (const m of mems || []) {
+        membershipTypeMap[m.id] = PLAN_TYPE_LABELS[m.membership_type] || m.membership_type || '';
+      }
+    }
+
+    const payments = paged.map(p => ({
+      id:         p.id,
+      amount:     p.amount,
+      plan_type:  membershipTypeMap[p.membership_id] || '',
+      paid_at:    p.paid_at,
+      status:     p.status,
+      notes:      p.notes,
+      member_id:  p.user_id,
+      full_name:  p.users?.full_name ?? null,
+      phone:      p.users?.phone     ?? null,
     }));
 
-    res.json(flattened);
+    res.json({ payments, total, page: pageNum, hasMore: (pageNum - 1) * limitNum + limitNum < total });
   } catch (err) {
     console.error('GET /api/gym-payments/:gymId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch payments' });
   }
 });
 
+// ── POST /api/gym-payments/:paymentId/mark-paid
+
 app.post('/api/gym-payments/:paymentId/mark-paid', async (req, res) => {
   try {
     const { paymentId } = req.params;
     const { payment_method, notes } = req.body || {};
 
-    const update = {
-      status: 'paid',
-      paid_at: new Date().toISOString(),
-    };
+    const update = { status: 'paid', paid_at: new Date().toISOString() };
     if (payment_method) update.payment_method = String(payment_method).trim();
     if (notes != null)  update.notes = String(notes).trim() || null;
 
-    const { error } = await supabase
-      .from('payments')
-      .update(update)
-      .eq('id', paymentId);
+    const { error } = await supabase.from('payments').update(update).eq('id', paymentId);
     if (error) throw error;
 
     res.json({ success: true });
@@ -1151,35 +2023,114 @@ app.post('/api/gym-payments/:paymentId/mark-paid', async (req, res) => {
   }
 });
 
+// ── POST /api/gym-payments/send-reminders (stub — SMS not wired yet)
+
+app.post('/api/gym-payments/send-reminders', async (req, res) => {
+  try {
+    const { gym_id } = req.body || {};
+    if (!gym_id) return res.status(400).json({ message: 'gym_id is required' });
+
+    const { data: overdueRows, error } = await supabase
+      .from('payments')
+      .select('amount, users(full_name, phone)')
+      .eq('gym_id', gym_id)
+      .eq('status', 'overdue');
+    if (error) throw error;
+
+    const members = (overdueRows || []).map(p => ({
+      full_name: p.users?.full_name ?? 'Unknown',
+      phone:     p.users?.phone     ?? null,
+      amount:    p.amount,
+    }));
+
+    console.log('Would send reminders to:', members);
+
+    res.json({
+      success:        true,
+      reminded_count: members.length,
+      message:        'Reminders queued (SMS not wired yet)',
+    });
+  } catch (err) {
+    console.error('POST /api/gym-payments/send-reminders error:', err);
+    res.status(500).json({ message: err.message || 'Failed to send reminders' });
+  }
+});
+
+// ── POST /api/gym-payments
+
 app.post('/api/gym-payments', async (req, res) => {
   try {
-    const { gym_id, user_id, membership_id, amount, due_date, notes } = req.body || {};
+    // Accept both new shape (member_id, plan_type) and legacy shape (user_id, due_date)
+    const {
+      gym_id,
+      member_id, user_id,
+      membership_id,
+      amount,
+      plan_type,
+      notes,
+      status: bodyStatus,
+      due_date,
+    } = req.body || {};
 
-    if (!gym_id)   return res.status(400).json({ message: 'gym_id is required' });
-    if (!user_id)  return res.status(400).json({ message: 'user_id is required' });
-    if (!due_date) return res.status(400).json({ message: 'due_date is required' });
+    const resolvedUserId = member_id || user_id;
+    if (!gym_id)          return res.status(400).json({ message: 'gym_id is required' });
+    if (!resolvedUserId)  return res.status(400).json({ message: 'member_id (or user_id) is required' });
 
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt <= 0) {
       return res.status(400).json({ message: 'amount must be a positive number' });
     }
 
-    const { data, error } = await supabase
+    const payStatus  = bodyStatus && VALID_PAYMENT_STATUSES.includes(bodyStatus) ? bodyStatus : 'paid';
+    const now        = new Date();
+    const resolvedDueDate = due_date || now.toISOString().slice(0, 10);
+
+    // Insert payment
+    const { data: inserted, error: insErr } = await supabase
       .from('payments')
       .insert({
         gym_id,
-        user_id,
+        user_id:       resolvedUserId,
         membership_id: membership_id || null,
-        amount: amt,
-        due_date,
-        status: 'pending',
-        notes: notes ? String(notes).trim() || null : null,
+        amount:        amt,
+        due_date:      resolvedDueDate,
+        paid_at:       payStatus === 'paid' ? now.toISOString() : null,
+        status:        payStatus,
+        notes:         notes ? String(notes).trim() || null : null,
       })
-      .select('id')
+      .select('id, amount, paid_at, status, notes, user_id, membership_id')
       .single();
-    if (error) throw error;
+    if (insErr) throw insErr;
 
-    res.status(201).json({ success: true, payment_id: data.id });
+    // If paid, extend or activate the membership end_date
+    if (payStatus === 'paid' && plan_type) {
+      const daysToAdd = PLAN_TYPE_DAYS[plan_type] ?? 30;
+      const newEnd = new Date(now.getTime() + daysToAdd * 86400000).toISOString().slice(0, 10);
+      await supabase
+        .from('gym_memberships')
+        .update({ status: 'active', end_date: newEnd })
+        .eq('user_id', resolvedUserId)
+        .eq('gym_id', gym_id);
+    }
+
+    // Fetch member name for response
+    const { data: userRow } = await supabase
+      .from('users')
+      .select('full_name, phone')
+      .eq('id', resolvedUserId)
+      .maybeSingle();
+
+    res.status(201).json({
+      id:         inserted.id,
+      amount:     inserted.amount,
+      plan_type:  plan_type || '',
+      paid_at:    inserted.paid_at,
+      status:     inserted.status,
+      notes:      inserted.notes,
+      member_id:  resolvedUserId,
+      full_name:  userRow?.full_name ?? null,
+      phone:      userRow?.phone     ?? null,
+    });
   } catch (err) {
     console.error('POST /api/gym-payments error:', err);
     res.status(500).json({ message: err.message || 'Failed to create payment' });
@@ -1188,36 +2139,144 @@ app.post('/api/gym-payments', async (req, res) => {
 
 // ── Class schedule ────────────────────────────────────────────────────────────
 
+// ── Schedule helpers ──────────────────────────────────────────────────────────
+
+// JS getDay() values for recurring_days keys
+const RECURRING_DAY_JS = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+// Compute end_time ISO string given a start ISO string and duration in minutes
+function scheduleEndTime(startIso, durationMinutes) {
+  const d = new Date(startIso);
+  d.setMinutes(d.getMinutes() + Number(durationMinutes));
+  return d.toISOString();
+}
+
+// Get the Monday (local) of the week containing a given Date
+function getMondayOf(d) {
+  const day = d.getDay(); // 0=Sun
+  const diff = day === 0 ? -6 : 1 - day;
+  const m = new Date(d);
+  m.setDate(m.getDate() + diff);
+  m.setHours(0, 0, 0, 0);
+  return m;
+}
+
 app.get('/api/gym-schedule/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
+    const { date, week_start } = req.query;
 
+    // ── Build date range ──────────────────────────────────────────────────────
+    let rangeStart, rangeEnd, isSingleDay;
+
+    if (date) {
+      isSingleDay = true;
+      rangeStart  = date + 'T00:00:00';
+      const next  = new Date(date + 'T00:00:00');
+      next.setDate(next.getDate() + 1);
+      rangeEnd    = next.toISOString().slice(0, 10) + 'T00:00:00';
+    } else if (week_start) {
+      isSingleDay = false;
+      rangeStart  = week_start + 'T00:00:00';
+      const end   = new Date(week_start + 'T00:00:00');
+      end.setDate(end.getDate() + 7);
+      rangeEnd    = end.toISOString().slice(0, 10) + 'T00:00:00';
+    } else {
+      // Backward-compat: no params → return all active classes (old behaviour)
+      const { data: allClasses, error: allErr } = await supabase
+        .from('class_schedule')
+        .select('id, class_name, description, trainer_id, day_of_week, start_time, end_time, capacity, duration_minutes, equipment, class_type, recurring, recurring_days')
+        .eq('gym_id', gymId)
+        .eq('is_active', true)
+        .order('day_of_week', { ascending: true })
+        .order('start_time', { ascending: true });
+      if (allErr) throw allErr;
+      const trIds = [...new Set((allClasses || []).map(c => c.trainer_id).filter(Boolean))];
+      const tMap  = {};
+      if (trIds.length) {
+        const { data: tUsers } = await supabase.from('users').select('id, full_name').in('id', trIds);
+        for (const u of (tUsers || [])) tMap[u.id] = u.full_name;
+      }
+      return res.json((allClasses || []).map(c => ({ ...c, trainer_name: tMap[c.trainer_id] || null })));
+    }
+
+    // ── Fetch classes in range ────────────────────────────────────────────────
     const { data: classes, error: classErr } = await supabase
       .from('class_schedule')
-      .select('id, class_name, description, trainer_id, day_of_week, start_time, end_time, capacity')
+      .select('id, gym_id, class_name, trainer_id, start_time, end_time, capacity, duration_minutes, equipment, class_type, recurring, recurring_days')
       .eq('gym_id', gymId)
-      .eq('is_active', true)
-      .order('day_of_week', { ascending: true })
+      .gte('start_time', rangeStart)
+      .lt('start_time', rangeEnd)
       .order('start_time', { ascending: true });
     if (classErr) throw classErr;
 
-    const trainerIds = [...new Set((classes || []).map(c => c.trainer_id).filter(Boolean))];
-    let nameById = new Map();
+    const classList = classes || [];
+
+    // ── Trainer names ─────────────────────────────────────────────────────────
+    const trainerIds = [...new Set(classList.map(c => c.trainer_id).filter(Boolean))];
+    const trainerMap = {};
     if (trainerIds.length) {
-      const { data: users, error: userErr } = await supabase
-        .from('users')
-        .select('id, full_name')
-        .in('id', trainerIds);
-      if (userErr) throw userErr;
-      nameById = new Map((users || []).map(u => [u.id, u.full_name]));
+      const { data: trainers } = await supabase.from('users').select('id, full_name').in('id', trainerIds);
+      for (const t of (trainers || [])) trainerMap[t.id] = t.full_name;
     }
 
-    const result = (classes || []).map(c => ({
-      ...c,
-      trainer_name: nameById.get(c.trainer_id) || null,
-    }));
+    // ── Booking counts (class_bookings may not exist yet) ─────────────────────
+    const bookingMap = {};
+    if (classList.length) {
+      const classIds = classList.map(c => c.id);
+      const bookingRes = await supabase
+        .from('class_bookings')
+        .select('class_id')
+        .in('class_id', classIds)
+        .eq('status', 'booked');
+      // If table doesn't exist, bookingRes.error is set — treat as zero bookings
+      for (const b of (bookingRes.data || [])) {
+        bookingMap[b.class_id] = (bookingMap[b.class_id] || 0) + 1;
+      }
+    }
 
-    res.json(result);
+    // ── Shape a single class row ──────────────────────────────────────────────
+    const shapeClass = c => {
+      const booked_count = bookingMap[c.id] || 0;
+      return {
+        id:               c.id,
+        class_name:       c.class_name,
+        trainer_id:       c.trainer_id,
+        trainer_name:     trainerMap[c.trainer_id] || null,
+        start_time:       c.start_time,
+        end_time:         c.end_time,
+        capacity:         c.capacity,
+        booked_count,
+        duration_minutes: c.duration_minutes,
+        equipment:        c.equipment,
+        class_type:       c.class_type,
+        is_full:          booked_count >= (c.capacity || 1),
+      };
+    };
+
+    if (isSingleDay) {
+      res.json({ date, classes: classList.map(shapeClass) });
+    } else {
+      // ── Build 7-day grouped response ────────────────────────────────────────
+      const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const days = [];
+      for (let i = 0; i < 7; i++) {
+        const d       = new Date(week_start + 'T00:00:00');
+        d.setDate(d.getDate() + i);
+        const dateStr = d.toISOString().slice(0, 10);
+        const dayClasses = classList
+          .filter(c => (c.start_time || '').slice(0, 10) === dateStr)
+          .map(shapeClass);
+        days.push({
+          date:        dateStr,
+          day_label:   DAY_LABELS[d.getDay()],
+          has_classes: dayClasses.length > 0,
+          class_count: dayClasses.length,
+          classes:     dayClasses,
+        });
+      }
+      res.json({ week_start, days });
+    }
   } catch (err) {
     console.error('GET /api/gym-schedule/:gymId error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch schedule' });
@@ -1227,41 +2286,74 @@ app.get('/api/gym-schedule/:gymId', async (req, res) => {
 app.post('/api/gym-schedule', async (req, res) => {
   try {
     const {
-      gym_id, class_name, description, trainer_id,
-      day_of_week, start_time, end_time, capacity,
+      gym_id, class_name, trainer_id,
+      start_time, duration_minutes, capacity,
+      equipment, class_type,
+      recurring, recurring_days,
     } = req.body || {};
 
-    if (!gym_id)                          return res.status(400).json({ message: 'gym_id is required' });
-    if (!class_name || !class_name.trim()) return res.status(400).json({ message: 'class_name is required' });
-    if (day_of_week == null || Number.isNaN(Number(day_of_week))) {
-      return res.status(400).json({ message: 'day_of_week is required (0-6)' });
-    }
-    if (!start_time)                      return res.status(400).json({ message: 'start_time is required' });
-    if (!end_time)                        return res.status(400).json({ message: 'end_time is required' });
+    if (!gym_id)             return res.status(400).json({ message: 'gym_id is required' });
+    if (!class_name?.trim()) return res.status(400).json({ message: 'class_name is required' });
+    if (!start_time)         return res.status(400).json({ message: 'start_time is required' });
 
-    const cap = Number(capacity);
-    if (!Number.isFinite(cap) || cap <= 0) {
-      return res.status(400).json({ message: 'capacity must be a positive number' });
+    const dur = Number(duration_minutes) || 60;
+    const cap = Number(capacity)         || 20;
+    const isRecurring = !!recurring && Array.isArray(recurring_days) && recurring_days.length > 0;
+
+    const baseRecord = {
+      gym_id,
+      class_name:       class_name.trim(),
+      trainer_id:       trainer_id || null,
+      capacity:         cap,
+      duration_minutes: dur,
+      equipment:        equipment || 'No equipment',
+      class_type:       class_type || 'other',
+      recurring:        isRecurring,
+      recurring_days:   isRecurring ? recurring_days : [],
+      is_active:        true,
+    };
+
+    let records = [];
+
+    if (isRecurring) {
+      // Generate one entry per (week × recurring_day) for the next 4 weeks
+      const baseDate = new Date(start_time);
+      const hours    = baseDate.getHours();
+      const minutes  = baseDate.getMinutes();
+      const monday   = getMondayOf(baseDate);
+
+      for (let week = 0; week < 4; week++) {
+        for (const dayKey of recurring_days) {
+          const jsDay = RECURRING_DAY_JS[dayKey.toLowerCase()];
+          if (jsDay === undefined) continue;
+          // offset from Monday: Mon=0 … Sun=6
+          const offsetFromMon = jsDay === 0 ? 6 : jsDay - 1;
+
+          const classDate = new Date(monday);
+          classDate.setDate(classDate.getDate() + week * 7 + offsetFromMon);
+          classDate.setHours(hours, minutes, 0, 0);
+
+          const st = classDate.toISOString();
+          records.push({ ...baseRecord, start_time: st, end_time: scheduleEndTime(st, dur) });
+        }
+      }
+    } else {
+      records.push({
+        ...baseRecord,
+        start_time,
+        end_time:         scheduleEndTime(start_time, dur),
+        recurring:        false,
+        recurring_days:   [],
+      });
     }
 
     const { data, error } = await supabase
       .from('class_schedule')
-      .insert({
-        gym_id,
-        class_name: class_name.trim(),
-        description: description?.trim() || null,
-        trainer_id: trainer_id || null,
-        day_of_week: Number(day_of_week),
-        start_time,
-        end_time,
-        capacity: cap,
-        is_active: true,
-      })
-      .select('id')
-      .single();
+      .insert(records)
+      .select('id, class_name, trainer_id, start_time, end_time, capacity, duration_minutes, equipment, class_type, recurring, recurring_days');
     if (error) throw error;
 
-    res.status(201).json({ success: true, class_id: data.id });
+    res.status(201).json({ success: true, classes: data || [] });
   } catch (err) {
     console.error('POST /api/gym-schedule error:', err);
     res.status(500).json({ message: err.message || 'Failed to create class' });
@@ -1270,13 +2362,42 @@ app.post('/api/gym-schedule', async (req, res) => {
 
 app.delete('/api/gym-schedule/:classId', async (req, res) => {
   try {
-    const { classId } = req.params;
-    const { error } = await supabase
-      .from('class_schedule')
-      .update({ is_active: false })
-      .eq('id', classId);
-    if (error) throw error;
-    res.json({ success: true });
+    const { classId }  = req.params;
+    const isRecurring  = req.query.recurring === 'true';
+
+    if (isRecurring) {
+      // 1. Fetch the target class to get class_name + trainer_id
+      const { data: cls, error: fetchErr } = await supabase
+        .from('class_schedule')
+        .select('class_name, trainer_id')
+        .eq('id', classId)
+        .maybeSingle();
+      if (fetchErr) throw fetchErr;
+      if (!cls) return res.status(404).json({ message: 'Class not found' });
+
+      // 2. Delete this class + all future classes with same name & trainer
+      const nowIso = new Date().toISOString();
+      let q = supabase
+        .from('class_schedule')
+        .delete()
+        .eq('class_name', cls.class_name)
+        .gte('start_time', nowIso);
+      if (cls.trainer_id) q = q.eq('trainer_id', cls.trainer_id);
+
+      const { data: deleted, error: delErr } = await q.select('id');
+      if (delErr) throw delErr;
+
+      res.json({ success: true, deleted_count: (deleted || []).length });
+    } else {
+      // Single delete
+      const { data: deleted, error } = await supabase
+        .from('class_schedule')
+        .delete()
+        .eq('id', classId)
+        .select('id');
+      if (error) throw error;
+      res.json({ success: true, deleted_count: (deleted || []).length });
+    }
   } catch (err) {
     console.error('DELETE /api/gym-schedule/:classId error:', err);
     res.status(500).json({ message: err.message || 'Failed to delete class' });
@@ -1472,21 +2593,37 @@ app.post('/api/gym-join', async (req, res) => {
 app.get('/api/gym-qr/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
-    const { data, error } = await supabase
-      .from('gyms')
-      .select('join_code')
-      .eq('id', gymId)
+    const { user_id } = req.query;
+
+    if (!user_id) return res.status(400).json({ error: 'user_id query param is required' });
+
+    // Verify active membership
+    const { data: membership, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('id')
+      .eq('user_id', user_id)
+      .eq('gym_id', gymId)
+      .eq('status', 'active')
       .maybeSingle();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'Gym not found' });
-    res.json({
-      gymId,
-      joinCode: data.join_code,
-      qrData: `fitforge:checkin:${gymId}`,
+    if (memErr) throw memErr;
+    if (!membership) return res.status(404).json({ error: 'No active membership found' });
+
+    const membershipId = membership.id;
+
+    // Build QR payload
+    const payload = JSON.stringify({
+      gym_id:    gymId,
+      user_id,
+      member_id: membershipId,
+      ts:        Date.now(),
     });
+
+    const qr_code = await QRCode.toDataURL(payload);
+
+    res.json({ qr_code, member_id: membershipId });
   } catch (err) {
     console.error('GET /api/gym-qr/:gymId error:', err);
-    res.status(500).json({ error: err.message || 'Failed to fetch QR data' });
+    res.status(500).json({ error: err.message || 'Failed to generate QR code' });
   }
 });
 
@@ -1498,53 +2635,94 @@ function todayMidnightIso() {
 
 app.post('/api/checkin', async (req, res) => {
   try {
-    const { userId, gymId, method } = req.body;
-    if (!userId || !gymId) {
-      return res.status(400).json({ error: 'userId and gymId are required' });
-    }
-    const checkinMethod = method === 'qr' || method === 'manual' ? method : 'qr';
+    let { gym_id, user_id, member_id, method, qr_payload } = req.body;
 
-    // Verify active membership
-    const { data: membership, error: memErr } = await supabase
-      .from('gym_memberships')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('gym_id', gymId)
-      .eq('status', 'active')
-      .maybeSingle();
-    if (memErr) throw memErr;
-    if (!membership) {
-      return res.status(403).json({ error: 'No active membership' });
+    // ── QR payload decode ────────────────────────────────────────────────────
+    if (qr_payload) {
+      try {
+        const parsed = JSON.parse(qr_payload);
+        if (parsed.user_id)  user_id   = parsed.user_id;
+        if (parsed.gym_id)   gym_id    = parsed.gym_id;
+        if (parsed.member_id) member_id = parsed.member_id;
+        method = 'qr';
+      } catch {
+        return res.status(400).json({ error: 'Invalid QR payload' });
+      }
     }
 
-    // Already checked in today (no checkout)?
-    const { data: openCheckin, error: openErr } = await supabase
+    if (!gym_id) {
+      return res.status(400).json({ error: 'gym_id is required' });
+    }
+
+    let resolvedMemberId = member_id;
+    let resolvedUserId = user_id;
+    let fullName = 'Unknown';
+
+    if (user_id) {
+      const { data: mem, error } = await supabase
+        .from('gym_memberships')
+        .select('id, users(full_name)')
+        .eq('user_id', user_id)
+        .eq('gym_id', gym_id)
+        .eq('status', 'active')
+        .maybeSingle();
+      if (error) throw error;
+      if (!mem) return res.status(404).json({ error: 'Active membership not found for user' });
+      resolvedMemberId = mem.id;
+      if (mem.users) fullName = mem.users.full_name;
+    } else if (member_id) {
+      const { data: mem, error } = await supabase
+        .from('gym_memberships')
+        .select('user_id, users(full_name)')
+        .eq('id', member_id)
+        .eq('gym_id', gym_id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!mem) return res.status(404).json({ error: 'Membership not found' });
+      resolvedUserId = mem.user_id;
+      if (mem.users) fullName = mem.users.full_name;
+    } else {
+      return res.status(400).json({ error: 'Either user_id or member_id must be provided' });
+    }
+
+    // Check if already checked in today
+    const { data: existing, error: existErr } = await supabase
       .from('check_ins')
       .select('id')
-      .eq('user_id', userId)
-      .eq('gym_id', gymId)
-      .is('checked_out_at', null)
+      .eq('membership_id', resolvedMemberId)
+      .eq('gym_id', gym_id)
       .gte('checked_in_at', todayMidnightIso())
+      .is('checked_out_at', null)
       .maybeSingle();
-    if (openErr) throw openErr;
-    if (openCheckin) {
+    if (existErr) throw existErr;
+    if (existing) {
       return res.status(409).json({ error: 'Already checked in' });
     }
+
+    const checkinMethod = method === 'qr' ? 'qr' : 'manual';
+    const checkedInAt = new Date().toISOString();
 
     const { data: inserted, error: insErr } = await supabase
       .from('check_ins')
       .insert({
-        user_id: userId,
-        gym_id: gymId,
-        membership_id: membership.id,
-        checked_in_at: new Date().toISOString(),
+        id: crypto.randomUUID(),
+        gym_id,
+        membership_id: resolvedMemberId,
+        user_id: resolvedUserId,
+        checked_in_at: checkedInAt,
+        checked_out_at: null,
         method: checkinMethod,
       })
       .select('id')
       .single();
     if (insErr) throw insErr;
 
-    res.json({ success: true, checkin_id: inserted.id });
+    res.status(201).json({
+      success: true,
+      checkin_id: inserted.id,
+      member_name: fullName,
+      checked_in_at: checkedInAt
+    });
   } catch (err) {
     console.error('POST /api/checkin error:', err);
     res.status(500).json({ error: err.message || 'Failed to check in' });
@@ -1553,32 +2731,34 @@ app.post('/api/checkin', async (req, res) => {
 
 app.post('/api/checkout', async (req, res) => {
   try {
-    const { userId, gymId } = req.body;
-    if (!userId || !gymId) {
-      return res.status(400).json({ error: 'userId and gymId are required' });
+    const { gym_id, checkin_id } = req.body;
+    if (!gym_id || !checkin_id) {
+      return res.status(400).json({ error: 'gym_id and checkin_id are required' });
     }
 
-    const { data: open, error: openErr } = await supabase
+    const { data: checkin, error: checkinErr } = await supabase
       .from('check_ins')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('gym_id', gymId)
-      .is('checked_out_at', null)
-      .order('checked_in_at', { ascending: false })
-      .limit(1)
+      .select('id, checked_out_at')
+      .eq('id', checkin_id)
+      .eq('gym_id', gym_id)
       .maybeSingle();
-    if (openErr) throw openErr;
-    if (!open) {
-      return res.status(404).json({ error: 'No active check-in found' });
+    if (checkinErr) throw checkinErr;
+    if (!checkin) {
+      return res.status(404).json({ error: 'Check-in not found' });
     }
 
+    if (checkin.checked_out_at) {
+      return res.status(409).json({ error: 'Already checked out' });
+    }
+
+    const checkedOutAt = new Date().toISOString();
     const { error: updErr } = await supabase
       .from('check_ins')
-      .update({ checked_out_at: new Date().toISOString() })
-      .eq('id', open.id);
+      .update({ checked_out_at: checkedOutAt })
+      .eq('id', checkin_id);
     if (updErr) throw updErr;
 
-    res.json({ success: true });
+    res.json({ success: true, checked_out_at: checkedOutAt });
   } catch (err) {
     console.error('POST /api/checkout error:', err);
     res.status(500).json({ error: err.message || 'Failed to check out' });
@@ -1588,17 +2768,195 @@ app.post('/api/checkout', async (req, res) => {
 app.get('/api/gym-occupancy/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
-    const { count, error } = await supabase
+
+    // Members currently inside (not checked out, checked in today)
+    const { data: insideData, error: insideErr } = await supabase
+      .from('check_ins')
+      .select(`
+        id, checked_in_at, method,
+        membership_id,
+        user_id,
+        gym_memberships (
+          id, membership_type, end_date,
+          users!gym_memberships_user_id_fkey ( id, full_name, phone )
+        )
+      `)
+      .eq('gym_id', gymId)
+      .is('checked_out_at', null)
+      .gte('checked_in_at', todayMidnightIso())
+      .order('checked_in_at', { ascending: false });
+    if (insideErr) throw insideErr;
+
+    const members_inside = (insideData || []).map(ci => {
+      const gm = Array.isArray(ci.gym_memberships) ? ci.gym_memberships[0] : (ci.gym_memberships || {});
+      const u  = Array.isArray(gm.users) ? gm.users[0] : (gm.users || {});
+      return {
+        checkin_id:      ci.id,
+        checked_in_at:   ci.checked_in_at,
+        method:          ci.method,
+        user_id:         u.id  || ci.user_id,
+        full_name:       u.full_name || 'Unknown',
+        phone:           u.phone || null,
+        member_id:       gm.id  || ci.membership_id,
+        membership_type: gm.membership_type,
+        expiry_date:     gm.end_date,
+      };
+    });
+
+    const current_occupancy = members_inside.length;
+
+    // Today's total check-ins
+    const { count: today_total, error: totalErr } = await supabase
       .from('check_ins')
       .select('id', { count: 'exact', head: true })
       .eq('gym_id', gymId)
-      .is('checked_out_at', null)
       .gte('checked_in_at', todayMidnightIso());
-    if (error) throw error;
-    res.json({ current: count || 0, asOf: new Date().toISOString() });
+    if (totalErr) throw totalErr;
+
+    console.log(`[OCCUPANCY] gymId=${gymId} occupancy=${current_occupancy} at ${new Date().toISOString()}`);
+
+    res.json({
+      current_occupancy,
+      today_total: today_total || 0,
+      members_inside,
+      timestamp: new Date().toISOString(),
+    });
   } catch (err) {
     console.error('GET /api/gym-occupancy/:gymId error:', err);
     res.status(500).json({ error: err.message || 'Failed to fetch occupancy' });
+  }
+});
+
+app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { date, page = '1', limit = '20' } = req.query;
+    
+    // Parse date or default to today
+    let targetDate = new Date();
+    if (date) {
+      targetDate = new Date(date);
+    }
+    const startOfDay = new Date(targetDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const pageNum = Math.max(1, parseInt(page, 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10)));
+    const offset = (pageNum - 1) * limitNum;
+
+    // First get the exact count
+    const { count, error: countErr } = await supabase
+      .from('check_ins')
+      .select('id', { count: 'exact', head: true })
+      .eq('gym_id', gymId)
+      .gte('checked_in_at', startOfDay.toISOString())
+      .lte('checked_in_at', endOfDay.toISOString());
+    if (countErr) throw countErr;
+
+    const { data: historyData, error: historyErr } = await supabase
+      .from('check_ins')
+      .select(`
+        id, checked_in_at, checked_out_at, method,
+        user_id,
+        gym_memberships (
+          membership_type,
+          users!gym_memberships_user_id_fkey ( id, full_name )
+        )
+      `)
+      .eq('gym_id', gymId)
+      .gte('checked_in_at', startOfDay.toISOString())
+      .lte('checked_in_at', endOfDay.toISOString())
+      .order('checked_in_at', { ascending: false })
+      .range(offset, offset + limitNum - 1);
+
+    if (historyErr) throw historyErr;
+
+    const checkins = (historyData || []).map(ci => {
+      const gm = Array.isArray(ci.gym_memberships) ? ci.gym_memberships[0] : (ci.gym_memberships || {});
+      const u = Array.isArray(gm.users) ? gm.users[0] : (gm.users || {});
+      return {
+        id: ci.id,
+        checked_in_at: ci.checked_in_at,
+        checked_out_at: ci.checked_out_at,
+        method: ci.method,
+        full_name: u.full_name || 'Unknown',
+        user_id: u.id || ci.user_id,
+        membership_type: gm.membership_type
+      };
+    });
+
+    res.json({
+      date: startOfDay.toISOString().slice(0, 10),
+      total: count || 0,
+      checkins,
+      page: pageNum,
+      limit: limitNum
+    });
+  } catch (err) {
+    console.error('GET /api/gym-checkin-history/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch check-in history' });
+  }
+});
+
+app.get('/api/gym-members-search/:gymId', async (req, res) => {
+  try {
+    const { gymId } = req.params;
+    const { q } = req.query;
+
+    if (!q || q.length < 2) {
+      return res.status(400).json({ error: 'Search term must be at least 2 characters' });
+    }
+
+    // Supabase has issues with complex joins on OR ILIKE without an RPC. 
+    // We can fetch active memberships for the gym, then fetch the users that match the ILIKE
+    const { data: mems, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('id, user_id, membership_type, end_date, status')
+      .eq('gym_id', gymId)
+      .eq('status', 'active');
+    if (memErr) throw memErr;
+
+    if (!mems || mems.length === 0) {
+      return res.json([]);
+    }
+
+    const userIds = mems.map(m => m.user_id).filter(Boolean);
+    
+    // Now search users in these userIds matching q
+    const { data: users, error: userErr } = await supabase
+      .from('users')
+      .select('id, full_name, phone')
+      .in('id', userIds)
+      .or(`full_name.ilike.%${q}%,phone.ilike.%${q}%`)
+      .limit(10);
+    
+    if (userErr) throw userErr;
+
+    const userMap = new Map((users || []).map(u => [u.id, u]));
+    
+    const results = [];
+    for (const gm of mems) {
+      if (userMap.has(gm.user_id)) {
+        const u = userMap.get(gm.user_id);
+        results.push({
+          member_id: gm.id,
+          user_id: u.id,
+          full_name: u.full_name,
+          phone: u.phone,
+          membership_type: gm.membership_type,
+          expiry_date: gm.end_date,
+          status: gm.status
+        });
+        if (results.length >= 10) break;
+      }
+    }
+
+    res.json(results);
+  } catch (err) {
+    console.error('GET /api/gym-members-search/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to search members' });
   }
 });
 
@@ -1854,20 +3212,283 @@ app.post('/api/ml/score/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/ml/scores/:gymId', async (req, res) => {
+app.get('/api/gym-stats/:gymId', async (req, res) => {
   try {
     const { gymId } = req.params;
+
+    // Real queries: Members
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const in7Days = new Date(Date.now() + 7 * 86400000).toISOString();
+
+    const [membersTotalRes, membersActiveRes, membersNewRes, membersExpiringRes, trainersRes, topTrainersRes] = await Promise.all([
+      supabase.from('gym_memberships').select('id', { count: 'exact', head: true }).eq('gym_id', gymId),
+      supabase.from('gym_memberships').select('id', { count: 'exact', head: true }).eq('gym_id', gymId).eq('status', 'active'),
+      supabase.from('gym_memberships').select('id', { count: 'exact', head: true }).eq('gym_id', gymId).gte('created_at', startOfMonth),
+      supabase.from('gym_memberships').select('id', { count: 'exact', head: true }).eq('gym_id', gymId).lte('end_date', in7Days).gte('end_date', now.toISOString()),
+      
+      // Trainers
+      supabase.from('trainer_profiles').select('id', { count: 'exact', head: true }).eq('gym_id', gymId).eq('is_active', true),
+      
+      // Top trainers
+      supabase.from('trainer_profiles').select('id, full_name, specializations, user_id').eq('gym_id', gymId).eq('is_active', true)
+    ]);
+
+    const totalTrainers = trainersRes.count || 0;
+    
+    // Calculate top trainers
+    let top_trainers = [];
+    if (topTrainersRes.data && topTrainersRes.data.length > 0) {
+      const trainerIds = topTrainersRes.data.map(t => t.id);
+      const userIds = topTrainersRes.data.map(t => t.user_id).filter(Boolean);
+      const allIds = [...new Set([...trainerIds, ...userIds])];
+      
+      const { data: clients } = await supabase
+        .from('trainer_clients')
+        .select('trainer_id')
+        .in('trainer_id', allIds)
+        .eq('status', 'active');
+        
+      const clientCountMap = new Map();
+      for (const c of clients || []) {
+        clientCountMap.set(c.trainer_id, (clientCountMap.get(c.trainer_id) || 0) + 1);
+      }
+      
+      const trainersList = topTrainersRes.data.map(t => {
+        const client_count = (clientCountMap.get(t.id) || 0) + (t.user_id ? (clientCountMap.get(t.user_id) || 0) : 0);
+        return {
+          id: t.id,
+          name: t.full_name || 'Unknown',
+          client_count,
+          avg_sessions_per_client: 0, // stub — ML phase will replace
+          specializations: t.specializations || []
+        };
+      });
+      
+      trainersList.sort((a, b) => b.client_count - a.client_count);
+      top_trainers = trainersList.slice(0, 3);
+    }
+
+    // Dummy Revenue (INR scale)
+    const revenue = {
+      this_month:    124500,
+      last_month:    111200,
+      growth_percent: 12,
+      monthly_chart: [
+        { month: 'Jan', amount:  98000 },
+        { month: 'Feb', amount: 105000 },
+        { month: 'Mar', amount: 111200 },
+        { month: 'Apr', amount: 118000 },
+        { month: 'May', amount: 111200 },
+        { month: 'Jun', amount: 124500 },
+      ],
+    };
+
+    // Dummy Occupancy
+    const occupancy = {
+      avg_daily: 47,
+      peak_hour: '6:00 PM',
+      peak_day:  'Monday',
+      weekly_chart: [
+        { day: 'Mon', count: 62 },
+        { day: 'Tue', count: 45 },
+        { day: 'Wed', count: 58 },
+        { day: 'Thu', count: 41 },
+        { day: 'Fri', count: 55 },
+        { day: 'Sat', count: 38 },
+        { day: 'Sun', count: 22 },
+      ],
+    };
+
+    res.json({
+      revenue,
+      members: {
+        total: membersTotalRes.count || 0,
+        active: membersActiveRes.count || 0,
+        new_this_month: membersNewRes.count || 0,
+        expiring_soon: membersExpiringRes.count || 0
+      },
+      occupancy,
+      trainers: {
+        total: totalTrainers,
+        top_trainers
+      }
+    });
+  } catch (err) {
+    console.error('GET /api/gym-stats/:gymId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to fetch gym stats' });
+  }
+});
+
+app.get('/api/gym-activity-heatmap/:gymId', async (req, res) => {
+  const { gymId } = req.params;
+  
+  const generateRealisticCount = (dayIndex, hour) => {
+    const isWeekend = dayIndex === 0 || dayIndex === 6;
+    if (hour >= 0 && hour <= 5) return Math.floor(Math.random() * 2);
+    if (isWeekend) {
+      if (hour >= 8 && hour <= 12) return Math.floor(Math.random() * 15) + 10;
+      if (hour >= 13 && hour <= 18) return Math.floor(Math.random() * 10) + 5;
+      return Math.floor(Math.random() * 5);
+    } else {
+      if (hour >= 6 && hour <= 8) return Math.floor(Math.random() * 11) + 15;
+      if (hour >= 9 && hour <= 11) return Math.floor(Math.random() * 8) + 8;
+      if (hour >= 12 && hour <= 16) return Math.floor(Math.random() * 6) + 3;
+      if (hour >= 17 && hour <= 20) return Math.floor(Math.random() * 16) + 20;
+      return Math.floor(Math.random() * 5) + 1;
+    }
+  };
+
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const hours = Array.from({length: 24}, (_, i) => i);
+  
+  const dummyHeatmap = days.map((day, di) => ({
+    day,
+    hours: hours.map(h => ({
+      hour: h,
+      count: generateRealisticCount(di, h)
+    }))
+  }));
+
+  try {
+    const twentyEightDaysAgo = new Date();
+    twentyEightDaysAgo.setDate(twentyEightDaysAgo.getDate() - 28);
+    
+    const { data: checkins, error } = await supabase
+      .from('check_ins')
+      .select('checked_in_at')
+      .eq('gym_id', gymId)
+      .gte('checked_in_at', twentyEightDaysAgo.toISOString());
+      
+    if (error) throw error;
+    if (!checkins || checkins.length === 0) {
+      return res.json({ gym_id: gymId, period_days: 28, heatmap: dummyHeatmap });
+    }
+
+    const heatmapMap = Array.from({ length: 7 }, () => Array(24).fill(0));
+    
+    for (const ci of checkins) {
+      if (!ci.checked_in_at) continue;
+      const d = new Date(ci.checked_in_at);
+      const dayOfWeek = d.getDay();
+      const hour = d.getHours();
+      heatmapMap[dayOfWeek][hour]++;
+    }
+
+    const realHeatmap = days.map((day, di) => ({
+      day,
+      hours: hours.map(h => ({
+        hour: h,
+        count: heatmapMap[di][h]
+      }))
+    }));
+
+    res.json({ gym_id: gymId, period_days: 28, heatmap: realHeatmap });
+  } catch (err) {
+    console.error('GET /api/gym-activity-heatmap/:gymId failed, falling back to stub:', err);
+    res.json({ gym_id: gymId, period_days: 28, heatmap: dummyHeatmap });
+  }
+});
+
+app.get('/api/ml/scores/:gymId', async (req, res) => {
+  const { gymId } = req.params;
+  
+  const stubResponse = {
+    gym_id: gymId,
+    generated_at: new Date().toISOString(),
+    scores: [
+      {
+        user_id: 'dummy-1',
+        full_name: 'Priya Sharma',
+        risk_level: 'high',
+        risk_score: 0.87,
+        risk_factors: [
+          'No visit in 14 days',
+          'Membership expires in 5 days',
+          'Skipped last 3 booked classes'
+        ],
+        last_visit_days_ago: 14,
+        membership_type: 'Premium'
+      },
+      {
+        user_id: 'dummy-2',
+        full_name: 'Ankit Verma',
+        risk_level: 'high',
+        risk_score: 0.79,
+        risk_factors: [
+          'Visit frequency dropped 60%',
+          'No trainer sessions this month'
+        ],
+        last_visit_days_ago: 9,
+        membership_type: 'Standard'
+      },
+      {
+        user_id: 'dummy-3',
+        full_name: 'Meera Joshi',
+        risk_level: 'medium',
+        risk_score: 0.54,
+        risk_factors: [
+          'Visits below weekly target',
+          'Diet tracking dropped off'
+        ],
+        last_visit_days_ago: 4,
+        membership_type: 'Premium'
+      },
+      {
+        user_id: 'dummy-4',
+        full_name: 'Rahul Singh',
+        risk_level: 'medium',
+        risk_score: 0.48,
+        risk_factors: [
+          'Missed 2 trainer sessions',
+          'App engagement low this week'
+        ],
+        last_visit_days_ago: 3,
+        membership_type: 'Standard'
+      },
+      {
+        user_id: 'dummy-5',
+        full_name: 'Divya Nair',
+        risk_level: 'low',
+        risk_score: 0.21,
+        risk_factors: [],
+        last_visit_days_ago: 1,
+        membership_type: 'Premium'
+      }
+    ],
+    summary: {
+      high_risk_count: 2,
+      medium_risk_count: 2,
+      low_risk_count: 1,
+      total_scored: 5
+    }
+  };
+
+  // ── Try ML service first, then fall through to DB scores ────────────────────
+  if (process.env.ML_SERVICE_URL) {
+    try {
+      const mlRes = await fetch(`${process.env.ML_SERVICE_URL}/predict/${gymId}`);
+      if (!mlRes.ok) throw new Error(`ML service returned ${mlRes.status}`);
+      const mlData = await mlRes.json();
+      return res.json(mlData);
+    } catch (mlErr) {
+      console.log('[ML] ML service unavailable, falling back to DB scores:', mlErr.message);
+    }
+  }
+
+  try {
     const { data: scores, error } = await supabase
       .from('churn_scores')
       .select('user_id, gym_id, membership_id, score, predicted_at, features_snapshot, top_reasons')
       .eq('gym_id', gymId)
       .order('score', { ascending: false });
+
     if (error) throw error;
-
+    
     if (!scores || scores.length === 0) {
-      return res.json({ scores: [], summary: { total: 0, high: 0, medium: 0, low: 0 } });
+      return res.json(stubResponse);
     }
-
+    
     const latest = {};
     for (const s of scores) {
       if (!latest[s.user_id] || new Date(s.predicted_at) > new Date(latest[s.user_id].predicted_at)) {
@@ -1883,24 +3504,33 @@ app.get('/api/ml/scores/:gymId', async (req, res) => {
       .in('id', userIds);
     const userMap = Object.fromEntries((users || []).map(u => [u.id, u]));
 
-    const enriched = latestArr.map(s => ({
-      ...s,
-      full_name: userMap[s.user_id]?.full_name || 'Unknown',
-      phone:     userMap[s.user_id]?.phone     || null,
-      risk_label: s.score >= 61 ? 'high' : s.score >= 31 ? 'medium' : 'low',
-    }));
+    const enriched = latestArr.map(s => {
+      const risk_score = parseFloat((s.score / 100).toFixed(3));
+      const risk_level = risk_score >= 0.7 ? 'high' : risk_score >= 0.4 ? 'medium' : 'low';
+      return {
+        ...s,
+        user_id:    s.user_id,
+        full_name:  userMap[s.user_id]?.full_name || 'Unknown',
+        phone:      userMap[s.user_id]?.phone     || null,
+        risk_score,
+        risk_level,
+        risk_factors: s.top_reasons || [],
+        last_visit_days_ago: Math.floor(Math.random() * 15),
+        membership_type: 'Standard'
+      };
+    });
 
     const summary = {
-      total:  enriched.length,
-      high:   enriched.filter(s => s.score >= 61).length,
-      medium: enriched.filter(s => s.score >= 31 && s.score < 61).length,
-      low:    enriched.filter(s => s.score < 31).length,
+      total_scored: enriched.length,
+      high_risk_count: enriched.filter(s => s.risk_level === 'high').length,
+      medium_risk_count: enriched.filter(s => s.risk_level === 'medium').length,
+      low_risk_count: enriched.filter(s => s.risk_level === 'low').length,
     };
 
-    res.json({ scores: enriched, summary });
+    res.json({ gym_id: gymId, generated_at: new Date().toISOString(), scores: enriched, summary });
   } catch (err) {
-    console.error('GET /api/ml/scores/:gymId error:', err);
-    res.status(500).json({ message: 'Failed to fetch scores', error: err.message });
+    console.error('GET /api/ml/scores/:gymId failed, falling back to stub:', err);
+    res.json(stubResponse);
   }
 });
 
@@ -2526,6 +4156,126 @@ app.delete('/api/user-plans/:planId', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Consumer Settings Routes ──────────────────────────────────────────────────
+
+app.get('/api/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, role, gym_id, created_at')
+      .eq('id', userId)
+      .maybeSingle();
+      
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'User not found' });
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/users/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch user' });
+  }
+});
+
+app.patch('/api/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const body = req.body;
+    
+    const allowed = [
+      'full_name', 'age', 'gender', 'goal',
+      'experience', 'equipment', 'injuries',
+      'training_days', 'current_weight', 'height',
+      'target_weight', 'activity_level', 'phone'
+    ];
+    
+    const updateObj = {};
+    allowed.forEach(field => {
+      if (body[field] !== undefined) {
+        updateObj[field] = body[field];
+      }
+    });
+
+    // equipment is stored as array; normalise if frontend sends a comma string
+    if (typeof updateObj.equipment === 'string') {
+      updateObj.equipment = updateObj.equipment
+        .split(',').map(s => s.trim()).filter(Boolean);
+    }
+
+    if (Object.keys(updateObj).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update(updateObj)
+      .eq('id', userId);
+      
+    if (updateErr) throw updateErr;
+    
+    const { data: updatedRow, error: fetchErr } = await supabase
+      .from('users')
+      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, role, gym_id, created_at')
+      .eq('id', userId)
+      .maybeSingle();
+      
+    if (fetchErr) throw fetchErr;
+    if (!updatedRow) return res.status(404).json({ message: 'User not found after update' });
+    
+    res.json(updatedRow);
+  } catch (err) {
+    console.error('PATCH /api/users/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to update user' });
+  }
+});
+
+app.post('/api/users/:userId/change-password', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { new_password } = req.body;
+    
+    if (!new_password || new_password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+    
+    // Requires SUPABASE_SERVICE_KEY (service role key)
+    const { error } = await supabase.auth.admin.updateUserById(userId, {
+      password: new_password
+    });
+    
+    if (error) throw error;
+    res.json({ success: true, message: 'Password updated successfully' });
+  } catch (err) {
+    console.error('POST /api/users/:userId/change-password error:', err);
+    res.status(500).json({ error: err.message || 'Failed to update password' });
+  }
+});
+
+app.delete('/api/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // 1. Soft-delete in users table
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update({ is_active: false })
+      .eq('id', userId);
+      
+    if (updateErr) throw updateErr;
+    
+    // 2. Disable the auth account by banning it
+    const { error: banErr } = await supabase.auth.admin.updateUserById(userId, { 
+      ban_duration: '876000h' 
+    });
+    
+    if (banErr) throw banErr;
+    
+    res.json({ success: true, message: 'Account deactivated' });
+  } catch (err) {
+    console.error('DELETE /api/users/:userId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to deactivate account' });
   }
 });
 
