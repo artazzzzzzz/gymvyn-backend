@@ -1758,25 +1758,22 @@ app.post('/api/gym-members/:memberId/renew', async (req, res) => {
 
 app.delete('/api/gym-members/:memberId', async (req, res) => {
   try {
+    // memberId is the users.id (the list returns user id as member id)
     const { memberId } = req.params;
 
-    // 1. Soft-delete: mark membership inactive (memberId is gym_memberships.id)
-    const { data: membership, error: memErr } = await supabase
+    // 1. Soft-delete all memberships for this user
+    const { error: memErr } = await supabase
       .from('gym_memberships')
       .update({ status: 'inactive' })
-      .eq('id', memberId)
-      .select('user_id')
-      .single();
+      .eq('user_id', memberId);
     if (memErr) throw memErr;
 
     // 2. Detach user from gym, reset role
-    if (membership?.user_id) {
-      const { error: userErr } = await supabase
-        .from('users')
-        .update({ gym_id: null, role: 'consumer' })
-        .eq('id', membership.user_id);
-      if (userErr) throw userErr;
-    }
+    const { error: userErr } = await supabase
+      .from('users')
+      .update({ gym_id: null, role: 'consumer' })
+      .eq('id', memberId);
+    if (userErr) throw userErr;
 
     res.json({ success: true, message: 'Member removed' });
   } catch (err) {
