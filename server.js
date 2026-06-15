@@ -1192,6 +1192,178 @@ app.post('/api/gym-members/csv-import', csvUpload.single('file'), async (req, re
   }
 });
 
+// ── POST /api/gym-members/manual  ────────────────────────────────────────────
+// Lightweight "add member by name + phone" — no membership_type or fee required.
+// Looks up an existing user by phone; if none found, creates a profile-only row.
+
+app.post('/api/gym-members/manual', async (req, res) => {
+  try {
+    const { gym_id, full_name, phone, plan_name } = req.body;
+
+    if (!gym_id)                          return res.status(400).json({ message: 'gym_id is required' });
+    if (!full_name || !full_name.trim())  return res.status(400).json({ message: 'full_name is required' });
+    if (phone && !/^\d{10}$/.test(phone.trim())) {
+      return res.status(400).json({ message: 'phone must be 10 digits' });
+    }
+
+    const trimmedName  = full_name.trim();
+    const trimmedPhone = phone ? phone.trim() : null;
+
+    // ── Check if an existing user (app account) has this phone ─────────────
+    let userId = null;
+    let status = 'active';
+
+    if (trimmedPhone) {
+      const { data: existingUser, error: lookupErr } = await supabase
+        .from('users')
+        .select('id')
+        .eq('phone', trimmedPhone)
+        .maybeSingle();
+      if (lookupErr) throw lookupErr;
+
+      if (existingUser) {
+        // Check not already a member of this gym
+        const { data: existingMem, error: memLookupErr } = await supabase
+          .from('gym_memberships')
+          .select('id')
+          .eq('gym_id', gym_id)
+          .eq('user_id', existingUser.id)
+          .maybeSingle();
+        if (memLookupErr) throw memLookupErr;
+        if (existingMem) {
+          return res.status(409).json({ message: 'This phone number is already a member of your gym' });
+        }
+        userId = existingUser.id;
+      }
+    }
+
+    // ── No app account found — create a profile-only user ─────────────────
+    if (!userId) {
+      userId = crypto.randomUUID();
+      const { error: userErr } = await supabase
+        .from('users')
+        .insert({
+          id: userId,
+          full_name: trimmedName,
+          phone: trimmedPhone,
+          role: 'gym_member',
+          gym_id,
+          is_active: true,
+        });
+      if (userErr) throw userErr;
+      status = trimmedPhone ? 'active' : 'pending';
+    }
+
+    // ── Insert gym_membership ──────────────────────────────────────────────
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: membership, error: memErr } = await supabase
+      .from('gym_memberships')
+      .insert({
+        user_id: userId,
+        gym_id,
+        status,
+        start_date: today,
+        metadata: { full_name: trimmedName, phone: trimmedPhone, plan_name: plan_name || null },
+      })
+      .select('id')
+      .single();
+
+    if (memErr) {
+      // rollback user creation only if we created them
+      if (status !== 'active' || !phone) {
+        await supabase.from('users').delete().eq('id', userId);
+      }
+      throw memErr;
+    }
+
+    res.status(201).json({ success: true, user_id: userId, membership_id: membership.id });
+  } catch (err) {
+    console.error('POST /api/gym-members/manual error:', err);
+    res.status(500).json({ message: err.message || 'Failed to add member' });
+  }
+});
+
+// ── POST /api/gym-members/import  ────────────────────────────────────────────
+// Bulk import from CSV. Each member: { full_name, phone, email, plan_name }
+// Looks up existing users by phone or email; creates pending profiles otherwise.
+
+app.post('/api/gym-members/import', async (req, res) => {
+  try {
+    const { gym_id, members } = req.body;
+    if (!gym_id)                   return res.status(400).json({ message: 'gym_id is required' });
+    if (!Array.isArray(members) || !members.length) {
+      return res.status(400).json({ message: 'members array is required' });
+    }
+
+    let imported = 0;
+    let skipped  = 0;
+    const today  = new Date().toISOString().slice(0, 10);
+
+    for (const m of members) {
+      const full_name = (m.full_name || '').trim();
+      const phone     = (m.phone || '').replace(/\D/g, '').slice(0, 10) || null;
+      const email     = (m.email || '').trim().toLowerCase() || null;
+      const plan_name = (m.plan_name || '').trim() || null;
+
+      if (!full_name && !phone) { skipped++; continue; }
+
+      try {
+        // ── Look up existing user by phone or email ─────────────────────
+        let existingUserId = null;
+
+        if (phone) {
+          const { data } = await supabase.from('users').select('id').eq('phone', phone).maybeSingle();
+          if (data) existingUserId = data.id;
+        }
+        if (!existingUserId && email) {
+          const { data } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
+          if (data) existingUserId = data.id;
+        }
+
+        if (existingUserId) {
+          // Skip if already a member of this gym
+          const { data: existingMem } = await supabase
+            .from('gym_memberships').select('id')
+            .eq('gym_id', gym_id).eq('user_id', existingUserId).maybeSingle();
+          if (existingMem) { skipped++; continue; }
+        }
+
+        // ── Create profile-only user if none found ──────────────────────
+        const userId = existingUserId || crypto.randomUUID();
+        if (!existingUserId) {
+          const { error: userErr } = await supabase.from('users').insert({
+            id: userId, full_name: full_name || null,
+            phone, role: 'gym_member', gym_id, is_active: true,
+          });
+          if (userErr) { skipped++; continue; }
+        }
+
+        // ── Insert gym_membership ───────────────────────────────────────
+        const { error: memErr } = await supabase.from('gym_memberships').insert({
+          user_id: userId,
+          gym_id,
+          status: existingUserId ? 'active' : 'pending',
+          start_date: today,
+          metadata: { full_name, phone, email, plan_name },
+        });
+        if (memErr) {
+          if (!existingUserId) await supabase.from('users').delete().eq('id', userId);
+          skipped++; continue;
+        }
+
+        imported++;
+      } catch {
+        skipped++;
+      }
+    }
+
+    res.json({ imported, skipped });
+  } catch (err) {
+    console.error('POST /api/gym-members/import error:', err);
+    res.status(500).json({ message: err.message || 'Import failed' });
+  }
+});
+
 // ── GET /api/gym-members  ─────────────────────────────────────────────────────
 
 const PLAN_TYPE_LABELS = {
@@ -1841,6 +2013,34 @@ app.post('/api/gym-members/:memberId/assign-trainer', async (req, res) => {
   } catch (err) {
     console.error('POST /api/gym-members/:memberId/assign-trainer error:', err);
     res.status(500).json({ message: err.message || 'Failed to assign trainer' });
+  }
+});
+
+// ── GET /api/gym/revenue  ─────────────────────────────────────────────────────
+// Returns SUM of payments.amount for status='paid' in the current calendar month.
+
+app.get('/api/gym/revenue', async (req, res) => {
+  try {
+    const gymId = req.query.gym_id;
+    if (!gymId) return res.status(400).json({ message: 'gym_id is required' });
+
+    const now            = new Date();
+    const monthStart     = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+    const { data, error } = await supabase
+      .from('payments')
+      .select('amount')
+      .eq('gym_id', gymId)
+      .eq('status', 'paid')
+      .gte('paid_at', monthStart);
+
+    if (error) throw error;
+
+    const revenue = (data || []).reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    res.json({ revenue: Math.round(revenue) });
+  } catch (err) {
+    console.error('GET /api/gym/revenue error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch revenue' });
   }
 });
 
