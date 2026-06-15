@@ -1264,7 +1264,6 @@ app.post('/api/gym-members/manual', async (req, res) => {
         user_id: userId,
         status: 'active',
         membership_type: plan_name || 'manual',
-        plan_name: plan_name || null,
         monthly_fee: 0,
         start_date: today,
       })
