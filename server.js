@@ -1259,9 +1259,12 @@ app.post('/api/gym-members/manual', async (req, res) => {
     const { data: membership, error: memErr } = await supabase
       .from('gym_memberships')
       .insert({
-        user_id: userId,
+        id: crypto.randomUUID(),
         gym_id,
-        status,
+        user_id: userId,
+        status: 'active',
+        membership_type: plan_name || 'manual',
+        plan_name: plan_name || null,
         start_date: today,
       })
       .select('id')
