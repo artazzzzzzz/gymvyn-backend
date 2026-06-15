@@ -1263,7 +1263,6 @@ app.post('/api/gym-members/manual', async (req, res) => {
         gym_id,
         status,
         start_date: today,
-        metadata: { full_name: trimmedName, phone: trimmedPhone, plan_name: plan_name || null },
       })
       .select('id')
       .single();
