@@ -1266,6 +1266,7 @@ app.post('/api/gym-members/manual', async (req, res) => {
         membership_type: plan_name || 'manual',
         monthly_fee: 0,
         start_date: today,
+        metadata: { full_name: trimmedName, phone: trimmedPhone, is_manual: true },
       })
       .select('id')
       .single();
