@@ -637,8 +637,14 @@ app.post('/api/gyms', async (req, res) => {
       .single();
 
     if (insertErr) {
+      console.error('POST /api/gyms insert error:', {
+        code:    insertErr.code,
+        message: insertErr.message,
+        details: insertErr.details,
+        hint:    insertErr.hint,
+      });
       if (insertErr.code === 'PGRST204' || insertErr.message?.includes('column')) {
-         throw new Error('Database schema is missing required columns. Please run migrations.');
+        throw new Error(`Database schema is missing required columns (${insertErr.message}). Please run migrations.`);
       }
       throw insertErr;
     }
@@ -1223,7 +1229,7 @@ app.get('/api/gym-members', async (req, res) => {
         end_date,
         status,
         created_at,
-        users!inner(id, full_name, phone, created_at)
+        users!gym_memberships_user_id_fkey!inner(id, full_name, phone, created_at)
       `)
       .eq('gym_id', gymId)
       .order('created_at', { ascending: false });
@@ -1242,7 +1248,15 @@ app.get('/api/gym-members', async (req, res) => {
     }
 
     const { data: rows, error } = await query;
-    if (error) throw error;
+    if (error) {
+      console.error('GET /api/gym-members query error:', {
+        code:    error.code,
+        message: error.message,
+        details: error.details,
+        hint:    error.hint,
+      });
+      throw error;
+    }
 
     // Name search in JS (PostgREST ILIKE on embedded columns is unreliable)
     let filtered = rows || [];
@@ -1298,7 +1312,13 @@ app.get('/api/gym-members', async (req, res) => {
 
     res.json({ members, total, page: pageNum, hasMore: offset + limitNum < total });
   } catch (err) {
-    console.error('GET /api/gym-members error:', err);
+    console.error('GET /api/gym-members error:', JSON.stringify({
+      message: err.message,
+      code:    err.code,
+      details: err.details,
+      hint:    err.hint,
+      stack:   err.stack,
+    }, null, 2));
     res.status(500).json({ message: err.message || 'Failed to fetch gym members' });
   }
 });
@@ -1377,7 +1397,7 @@ async function buildMemberDetail(memberId) {
     .from('gym_memberships')
     .select(`
       id, gym_id, membership_type, start_date, end_date, status,
-      users!inner(
+      users!gym_memberships_user_id_fkey!inner(
         id, full_name, phone, age, height, current_weight, gender, created_at
       )
     `)
@@ -4280,6 +4300,9 @@ app.delete('/api/users/:userId', async (req, res) => {
 });
 
 require('./foodSearchRoutes')(app, supabase);
+
+const exerciseRoutes = require('./routes/exerciseRoutes');
+app.use('/api/exercises', exerciseRoutes);
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
