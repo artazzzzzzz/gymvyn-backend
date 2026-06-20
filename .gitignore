@@ -1,4 +1,4 @@
 node_modules/
 .env
 scripts/test-ecosystem-credentials.md
-scripts/test-results-*.md
+scripts/test-results-api.md
