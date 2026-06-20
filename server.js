@@ -525,14 +525,22 @@ app.get('/posts/:postId/comments', async (req, res) => {
 
 app.get('/leaderboard', async (req, res) => {
   try {
+    // Top 10 by streak — streak lives on user_xp.current_streak, not users.
     const { data, error } = await supabase
-      .from('users')
-      .select('id, username, avatar_url, streak')
-      .order('streak', { ascending: false })
+      .from('user_xp')
+      .select('current_streak, total_xp, level, users!inner(id, full_name)')
+      .order('current_streak', { ascending: false })
       .limit(10);
 
     if (error) throw error;
-    res.json(data);
+    const flattened = (data || []).map((row) => ({
+      id: row.users.id,
+      full_name: row.users.full_name,
+      current_streak: row.current_streak,
+      total_xp: row.total_xp,
+      level: row.level,
+    }));
+    res.json(flattened);
   } catch (err) {
     console.error('GET /leaderboard error:', err);
     res.status(500).json({ message: err.message || 'Failed to fetch leaderboard' });
@@ -556,7 +564,7 @@ app.get('/buddy-suggestions/:userId', async (req, res) => {
 
     const { data, error } = await supabase
       .from('users')
-      .select('id, username, avatar_url, fitness_goal')
+      .select('id, full_name, goal')
       .not('id', 'in', `(${[...excludedIds].join(',')})`)
       .limit(20);
 
