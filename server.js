@@ -3926,7 +3926,46 @@ app.post('/api/food-logs', async (req, res) => {
       console.error('Food log insert error:', JSON.stringify(error, null, 2));
       return res.status(500).json({ message: error.message, details: error.details, hint: error.hint });
     }
-    res.json(data);
+
+    let xpResult = null;
+    try {
+      const { processDietXP } = require('./src/services/xpEngine');
+      const logDate = log_date || date || new Date().toISOString().slice(0, 10);
+
+      // Tally today's food logs after inserting the new one
+      const { data: todayLogs } = await supabase
+        .from('food_logs')
+        .select('protein_g, carbs_g, fat_g, calories, meal_type')
+        .eq('user_id', userId)
+        .eq('log_date', logDate);
+
+      const totals = (todayLogs || []).reduce((acc, l) => {
+        acc.protein += Number(l.protein_g) || 0;
+        acc.carbs += Number(l.carbs_g) || 0;
+        acc.fat += Number(l.fat_g) || 0;
+        return acc;
+      }, { protein: 0, carbs: 0, fat: 0 });
+
+      const { data: macros } = await supabase
+        .from('user_macros')
+        .select('protein_g, carbs_g, fat_g')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (macros && macros.protein_g) {
+        const mealsLogged = new Set((todayLogs || []).map(l => l.meal_type)).size;
+        xpResult = await processDietXP(supabase, userId, {
+          mealsLogged,
+          proteinPct: totals.protein / macros.protein_g,
+          carbsPct: totals.carbs / (macros.carbs_g || 1),
+          fatPct: totals.fat / (macros.fat_g || 1),
+        });
+      }
+    } catch (xpErr) {
+      console.error('Diet XP processing error (non-fatal):', xpErr.message);
+    }
+
+    res.json({ ...data, xpResult });
   } catch (err) {
     console.error('log food error:', err);
     res.status(500).json({ message: err.message || 'Failed to log food' });
@@ -4289,14 +4328,16 @@ app.post('/api/workout/finish', async (req, res) => {
 
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
-    const { error: updateError } = await supabase
+    const { data: updatedRow, error: updateError } = await supabase
       .from('workout_logs')
       .update({
         completed_at:     new Date().toISOString(),
         duration_minutes: durationMinutes,
         exercises:        exercises,
       })
-      .eq('id', sessionId);
+      .eq('id', sessionId)
+      .select()
+      .single();
 
     if (updateError) {
       console.error('Workout log update error:', updateError);
@@ -4314,9 +4355,36 @@ app.post('/api/workout/finish', async (req, res) => {
       }
     }
 
-    res.json({ success: true });
+    let xpResult = null;
+    try {
+      const { processWorkoutXP } = require('./src/services/xpEngine');
+      xpResult = await processWorkoutXP(supabase, updatedRow.user_id, {
+        exercises: exercises || [],
+        durationMinutes: durationMinutes || 0,
+        usedFormCoach: false,
+      });
+    } catch (xpErr) {
+      console.error('XP processing error (non-fatal):', xpErr.message);
+    }
+
+    res.json({ success: true, workoutId: updatedRow.id, workout: updatedRow, xpResult });
   } catch (err) {
     console.error('Finish workout error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/workout/logs/:workoutId — fetch a single workout log by id (for summary page refresh)
+app.get('/api/workout/logs/:workoutId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('workout_logs')
+      .select('*')
+      .eq('id', req.params.workoutId)
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -4508,8 +4576,25 @@ require('./foodSearchRoutes')(app, supabase);
 const exerciseRoutes = require('./routes/exerciseRoutes');
 app.use('/api/exercises', exerciseRoutes);
 
+const gymRoutes = require('./routes/gymRoutes');
+app.use('/api/gym', gymRoutes);
+
+const newTrainerRoutes = require('./routes/trainerRoutes');
+app.use('/api/trainer', newTrainerRoutes);
+
+const xpRoutes = require('./src/routes/xpRoutes');
+app.use('/api/xp', xpRoutes);
+
+const supplementRoutes = require('./routes/supplementRoutes');
+app.use('/api/supplements', supplementRoutes);
+
+const { initXPCrons } = require('./src/services/xpCron');
+
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
+  initXPCrons();
+  console.log('XP cron jobs initialized');
+
   console.log('Diet redesign routes registered:');
   console.log('  POST   /api/macros/calculate');
   console.log('  GET    /api/macros/:userId');
