@@ -312,19 +312,19 @@ Rules:
 
 app.post('/upload-progress-photo', upload.single('photo'), async (req, res) => {
   try {
-    const { userId, date, notes } = req.body;
+    const { userId, date, notes, angle } = req.body;
 
     if (!userId || !req.file) {
       return res.status(400).json({ message: 'Missing required fields: userId, photo' });
     }
 
     const photo_url = req.file.path;
-    const public_id = req.file.filename;
+    const cloudinary_id = req.file.filename;
 
     const { data, error } = await supabase
       .from('progress_photos')
-      .insert({ user_id: userId, photo_url, public_id, date, notes })
-      .select('id, photo_url, public_id, date, notes, created_at')
+      .insert({ user_id: userId, photo_url, cloudinary_id, angle: angle || 'front', taken_at: date, notes })
+      .select('id, photo_url, cloudinary_id, taken_at, notes, created_at')
       .single();
 
     if (error) throw error;
@@ -342,9 +342,9 @@ app.get('/progress-photos/:userId', async (req, res) => {
 
     const { data, error } = await supabase
       .from('progress_photos')
-      .select('id, photo_url, public_id, date, notes, created_at')
+      .select('id, photo_url, cloudinary_id, taken_at, notes, created_at')
       .eq('user_id', userId)
-      .order('date', { ascending: false });
+      .order('taken_at', { ascending: false });
 
     if (error) throw error;
 
@@ -2885,7 +2885,7 @@ app.post('/api/checkin', async (req, res) => {
     if (user_id) {
       const { data: mem, error } = await supabase
         .from('gym_memberships')
-        .select('id, users(full_name)')
+        .select('id, users!gym_memberships_user_id_fkey(full_name)')
         .eq('user_id', user_id)
         .eq('gym_id', gym_id)
         .eq('status', 'active')
@@ -2897,7 +2897,7 @@ app.post('/api/checkin', async (req, res) => {
     } else if (member_id) {
       const { data: mem, error } = await supabase
         .from('gym_memberships')
-        .select('user_id, users(full_name)')
+        .select('user_id, users!gym_memberships_user_id_fkey(full_name)')
         .eq('id', member_id)
         .eq('gym_id', gym_id)
         .maybeSingle();
@@ -4588,12 +4588,20 @@ app.use('/api/xp', xpRoutes);
 const supplementRoutes = require('./routes/supplementRoutes');
 app.use('/api/supplements', supplementRoutes);
 
+const expenseRoutes = require('./routes/expenseRoutes');
+app.use('/api/expenses', expenseRoutes);
+
+const lockerRoutes = require('./routes/lockerRoutes');
+app.use('/api/lockers', lockerRoutes);
+
 const { initXPCrons } = require('./src/services/xpCron');
+const { initLockerCrons } = require('./src/services/lockerCron');
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);
   initXPCrons();
   console.log('XP cron jobs initialized');
+  initLockerCrons();
 
   console.log('Diet redesign routes registered:');
   console.log('  POST   /api/macros/calculate');
