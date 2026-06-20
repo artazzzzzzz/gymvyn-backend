@@ -278,7 +278,7 @@ router.get('/challenges', auth, async (req, res) => {
       description: c.description,
       target_value: c.target_value,
       xp_reward: c.xp_reward,
-      progress: 0,
+      current_value: 0,
       completed: false,
     }));
 

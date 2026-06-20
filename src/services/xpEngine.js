@@ -536,7 +536,7 @@ async function updateChallengeProgress(supabase, userId, eventType) {
           }
         }
 
-        const updates = { progress: totalVolume };
+        const updates = { current_value: totalVolume };
         if (totalVolume >= challenge.target_value) {
           updates.completed = true;
           await supabase.from('weekly_challenges').update(updates).eq('id', challenge.id);
@@ -571,7 +571,7 @@ async function updateChallengeProgress(supabase, userId, eventType) {
           }
         }
 
-        const updates = { progress: maxE1RM };
+        const updates = { current_value: maxE1RM };
         if (maxE1RM >= challenge.target_value) {
           updates.completed = true;
           await supabase.from('weekly_challenges').update(updates).eq('id', challenge.id);
@@ -599,7 +599,7 @@ async function updateChallengeProgress(supabase, userId, eventType) {
         }
         const daysHit = Object.values(caloriesByDay).filter(cal => cal >= challenge.target_value).length;
 
-        const updates = { progress: daysHit };
+        const updates = { current_value: daysHit };
         if (daysHit >= 4) {
           updates.completed = true;
           await supabase.from('weekly_challenges').update(updates).eq('id', challenge.id);
