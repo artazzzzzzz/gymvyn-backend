@@ -399,7 +399,7 @@ app.get('/posts', async (req, res) => {
       .from('posts')
       .select(`
         *,
-        users ( username, avatar_url )
+        users!posts_user_id_fkey ( id, full_name )
       `)
       .order('created_at', { ascending: false })
       .limit(50);
@@ -510,7 +510,7 @@ app.get('/posts/:postId/comments', async (req, res) => {
       .from('post_comments')
       .select(`
         *,
-        users ( username, avatar_url )
+        users!post_comments_user_id_fkey ( id, full_name )
       `)
       .eq('post_id', postId)
       .order('created_at', { ascending: true });
