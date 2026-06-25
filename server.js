@@ -2452,37 +2452,64 @@ app.get('/api/gym-schedule/:gymId', async (req, res) => {
       for (const t of (trainers || [])) trainerMap[t.id] = t.full_name;
     }
 
-    // ── Booking counts (class_bookings may not exist yet) ─────────────────────
-    const bookingMap = {};
+    // ── Booking counts + waitlist + caller's own status ───────────────────────
+    const bookingMap   = {};   // class_id → booked count
+    const waitlistMap  = {};   // class_id → waitlisted count
+    const userStatusMap = {};  // class_id → 'booked' | 'waitlisted' (caller only)
+
     if (classList.length) {
       const classIds = classList.map(c => c.id);
+
+      // Try to identify the caller so we can return user_booking_status.
+      // Optional — unauthenticated callers (gym owner view) simply get null.
+      let callerId = null;
+      try {
+        const authHeader = req.headers.authorization || '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        if (token) {
+          const { data: authData } = await supabase.auth.getUser(token);
+          callerId = authData?.user?.id || null;
+        }
+      } catch { /* non-critical */ }
+
       const bookingRes = await supabase
         .from('class_bookings')
-        .select('class_id')
+        .select('class_id, status, user_id, waitlist_position')
         .in('class_id', classIds)
-        .eq('status', 'booked');
+        .in('status', ['booked', 'waitlisted']);
+
       // If table doesn't exist, bookingRes.error is set — treat as zero bookings
       for (const b of (bookingRes.data || [])) {
-        bookingMap[b.class_id] = (bookingMap[b.class_id] || 0) + 1;
+        if (b.status === 'booked') {
+          bookingMap[b.class_id] = (bookingMap[b.class_id] || 0) + 1;
+        } else if (b.status === 'waitlisted') {
+          waitlistMap[b.class_id] = (waitlistMap[b.class_id] || 0) + 1;
+        }
+        if (callerId && b.user_id === callerId) {
+          userStatusMap[b.class_id] = b.status;
+        }
       }
     }
 
     // ── Shape a single class row ──────────────────────────────────────────────
     const shapeClass = c => {
-      const booked_count = bookingMap[c.id] || 0;
+      const booked_count   = bookingMap[c.id]   || 0;
+      const waitlist_count = waitlistMap[c.id]  || 0;
       return {
-        id:               c.id,
-        class_name:       c.class_name,
-        trainer_id:       c.trainer_id,
-        trainer_name:     trainerMap[c.trainer_id] || null,
-        start_time:       c.start_time,
-        end_time:         c.end_time,
-        capacity:         c.capacity,
+        id:                   c.id,
+        class_name:           c.class_name,
+        trainer_id:           c.trainer_id,
+        trainer_name:         trainerMap[c.trainer_id] || null,
+        start_time:           c.start_time,
+        end_time:             c.end_time,
+        capacity:             c.capacity,
         booked_count,
-        duration_minutes: c.duration_minutes,
-        equipment:        c.equipment,
-        class_type:       c.class_type,
-        is_full:          booked_count >= (c.capacity || 1),
+        waitlist_count,
+        duration_minutes:     c.duration_minutes,
+        equipment:            c.equipment,
+        class_type:           c.class_type,
+        is_full:              booked_count >= (c.capacity || 1),
+        user_booking_status:  userStatusMap[c.id] || null,
       };
     };
 
@@ -4366,11 +4393,42 @@ app.post('/api/workout/finish', async (req, res) => {
     let xpResult = null;
     try {
       const { processWorkoutXP } = require('./src/services/xpEngine');
+
+      // Snapshot level before processing so we can detect a level-up
+      const { data: xpBefore } = await supabase
+        .from('user_xp')
+        .select('level')
+        .eq('user_id', updatedRow.user_id)
+        .maybeSingle();
+      const levelBefore = xpBefore?.level || 1;
+
       xpResult = await processWorkoutXP(supabase, updatedRow.user_id, {
         exercises: exercises || [],
         durationMinutes: durationMinutes || 0,
         usedFormCoach: false,
       });
+
+      // Fire-and-forget level-up achievement post
+      if (xpResult?.awarded && xpResult.newLevel > levelBefore) {
+        const { postAchievement } = require('./src/utils/feedAchievements');
+        supabase
+          .from('gym_memberships')
+          .select('gym_id')
+          .eq('user_id', updatedRow.user_id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+          .then(({ data: mem }) => {
+            if (mem?.gym_id) {
+              return postAchievement({
+                gymId:   mem.gym_id,
+                userId:  updatedRow.user_id,
+                content: `⚡ just reached Level ${xpResult.newLevel}!`,
+              });
+            }
+          })
+          .catch(err => console.error('Level-up feed post error (non-fatal):', err.message));
+      }
     } catch (xpErr) {
       console.error('XP processing error (non-fatal):', xpErr.message);
     }
@@ -4461,6 +4519,48 @@ app.delete('/api/user-plans/:planId', async (req, res) => {
 
 // ── Consumer Settings Routes ──────────────────────────────────────────────────
 
+// GET /api/users/lookup-user?email=X  — resolve email → { userId, fullName }
+app.get('/api/users/lookup-user', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email || !email.trim()) {
+      return res.status(400).json({ message: 'email query param is required' });
+    }
+
+    // Use admin REST endpoint to find user by email
+    const adminRes = await fetch(
+      `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(email.trim())}`,
+      {
+        headers: {
+          apikey: process.env.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+        },
+      }
+    );
+    const adminData = await adminRes.json();
+
+    const authUser = (adminData.users || []).find(
+      u => (u.email || '').toLowerCase() === email.trim().toLowerCase()
+    );
+
+    if (!authUser) return res.status(404).json({ message: 'No user found with that email' });
+
+    const { data: profileRow } = await supabase
+      .from('users')
+      .select('full_name')
+      .eq('id', authUser.id)
+      .maybeSingle();
+
+    res.json({
+      userId: authUser.id,
+      fullName: profileRow?.full_name || authUser.user_metadata?.full_name || authUser.email,
+    });
+  } catch (err) {
+    console.error('GET /api/users/lookup-user error:', err);
+    res.status(500).json({ message: err.message || 'Lookup failed' });
+  }
+});
+
 app.get('/api/users/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -4488,7 +4588,8 @@ app.patch('/api/users/:userId', async (req, res) => {
       'full_name', 'age', 'gender', 'goal',
       'experience', 'equipment', 'injuries',
       'training_days', 'current_weight', 'height',
-      'target_weight', 'activity_level', 'phone'
+      'target_weight', 'activity_level', 'phone',
+      'share_achievements',
     ];
     
     const updateObj = {};
@@ -4601,6 +4702,29 @@ app.use('/api/expenses', expenseRoutes);
 
 const lockerRoutes = require('./routes/lockerRoutes');
 app.use('/api/lockers', lockerRoutes);
+
+const staffRoutes = require('./routes/staffRoutes');
+app.use('/api/staff', staffRoutes);
+
+const measurementRoutes = require('./routes/measurementRoutes');
+app.use('/api/measurements', measurementRoutes);
+
+const gymFeedRoutes = require('./src/routes/gymFeedRoutes');
+app.use('/api/gym-feed', gymFeedRoutes);
+
+const reportsRoutes = require('./src/routes/reportsRoutes');
+app.use('/api/reports', reportsRoutes);
+
+const dietPlanRoutes = require('./routes/dietPlanRoutes');
+app.use('/api/diet-plans', dietPlanRoutes);
+
+app.use('/api/equipment', require('./routes/equipmentRoutes'));
+
+app.use('/api/chat', require('./routes/chatRoutes'));
+
+app.use('/api/trainer-earnings', require('./routes/trainerEarningsRoutes'));
+
+app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');
