@@ -1,9 +1,14 @@
 const OpenAI = require('openai');
 
-const client = new OpenAI({
-  apiKey: process.env.DEEPSEEK_API_KEY,
-  baseURL: 'https://api.deepseek.com/v1',
-});
+let _client = null;
+
+function getClient() {
+  if (!_client) {
+    if (!process.env.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY not set');
+    _client = new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com' });
+  }
+  return _client;
+}
 
 async function callDeepSeek({ system, user, responseFormat }) {
   const messages = [];
@@ -18,7 +23,7 @@ async function callDeepSeek({ system, user, responseFormat }) {
 
   let response;
   try {
-    response = await client.chat.completions.create(params);
+    response = await getClient().chat.completions.create(params);
   } catch (err) {
     throw new Error(`DeepSeek error: ${err.message}`);
   }
@@ -33,4 +38,4 @@ async function callDeepSeek({ system, user, responseFormat }) {
   };
 }
 
-module.exports = { client, callDeepSeek };
+module.exports = { getClient, callDeepSeek };

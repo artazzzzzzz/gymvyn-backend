@@ -1,9 +1,17 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+let _genAI = null;
+
+function getClient() {
+  if (!_genAI) {
+    if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
+    _genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  }
+  return _genAI;
+}
 
 async function callGeminiVision({ images, prompt, responseSchema }) {
-  const model = genAI.getGenerativeModel({
+  const model = getClient().getGenerativeModel({
     model: 'gemini-2.5-flash-lite',
     generationConfig: {
       responseMimeType: 'application/json',
@@ -11,7 +19,7 @@ async function callGeminiVision({ images, prompt, responseSchema }) {
     },
   });
 
-  const imageParts = images.map((base64, i) => ({
+  const imageParts = images.map((base64) => ({
     inlineData: {
       data: base64,
       mimeType: 'image/jpeg',
@@ -45,4 +53,4 @@ async function callGeminiVision({ images, prompt, responseSchema }) {
   };
 }
 
-module.exports = { genAI, callGeminiVision };
+module.exports = { getClient, callGeminiVision };

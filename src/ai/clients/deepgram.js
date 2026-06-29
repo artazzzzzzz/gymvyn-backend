@@ -1,6 +1,14 @@
 const { DeepgramClient } = require('@deepgram/sdk');
 
-const deepgram = new DeepgramClient(process.env.DEEPGRAM_API_KEY);
+let _client = null;
+
+function getClient() {
+  if (!_client) {
+    if (!process.env.DEEPGRAM_API_KEY) throw new Error('DEEPGRAM_API_KEY not set');
+    _client = new DeepgramClient(process.env.DEEPGRAM_API_KEY);
+  }
+  return _client;
+}
 
 async function transcribeAudio({ audioBuffer, mimeType, language }) {
   const options = {
@@ -22,7 +30,7 @@ async function transcribeAudio({ audioBuffer, mimeType, language }) {
   // HttpResponsePromise.fromPromise resolves to .data directly (not { data, rawResponse })
   let response;
   try {
-    response = await deepgram.listen.v1.media.transcribeFile(
+    response = await getClient().listen.v1.media.transcribeFile(
       { data: audioBuffer, contentType: mimeType },
       options
     );
@@ -42,4 +50,4 @@ async function transcribeAudio({ audioBuffer, mimeType, language }) {
   return { transcript, durationSeconds };
 }
 
-module.exports = { deepgram, transcribeAudio };
+module.exports = { getClient, transcribeAudio };
