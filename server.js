@@ -31,7 +31,14 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '15mb' }));
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+let _genAI = null;
+function getGenAI() {
+  if (!_genAI) {
+    if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
+    _genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  }
+  return _genAI;
+}
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 cloudinary.config({
@@ -141,7 +148,7 @@ Rules:
 - Reps can be a range like "8-10" or a number like "12"
 - Match exercises strictly to available equipment: ${equipment}`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
 
@@ -292,7 +299,7 @@ Rules:
 - Calories across all meals in a day should sum close to ${targetCalories}
 - Macros: protein ~${Math.round(targetCalories * 0.3 / 4)}g, carbs ~${Math.round(targetCalories * 0.45 / 4)}g, fat ~${Math.round(targetCalories * 0.25 / 9)}g`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
 
@@ -4097,7 +4104,7 @@ Use Indian food nutrition data. Common references:
 - 1 plate rajma chawal: ~400 cal, 15g protein, 65g carbs, 8g fat
 Be generous with common sense. If someone says 'lunch mein dal chawal khaya' assume 1 katori dal + 1 plate rice.`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
     const result = await model.generateContent([
       { text: systemPrompt },
       { text: `User said: "${transcript}"` },
@@ -4159,7 +4166,7 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
     const mimeMatch = imageBase64.match(/^data:(image\/\w+);base64,/);
     const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
     const result = await model.generateContent([
       { text: prompt },
       { inlineData: { mimeType, data: cleanedB64 } },
@@ -4242,7 +4249,7 @@ Return ONLY valid JSON, no markdown:
   ]
 }`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
     const result = await model.generateContent(prompt);
     const planData = extractJson(result.response.text());
 
