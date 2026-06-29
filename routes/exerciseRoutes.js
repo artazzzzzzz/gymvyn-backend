@@ -30,7 +30,7 @@ router.get('/:name/metadata', async (req, res) => {
   const name = decodeURIComponent(req.params.name);
   const { data, error } = await supabase
     .from('exercise_metadata')
-    .select('video_url, thumbnail_url, video_duration')
+    .select('video_url, thumbnail_url, video_duration, instructions, pro_tip')
     .eq('exercise_name', name)
     .maybeSingle();
 

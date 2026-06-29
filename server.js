@@ -23,6 +23,12 @@ const allowedOrigins = [
 
 app.use(cors());
 
+// Top-level request probe — remove once 500 is diagnosed
+app.use((req, res, next) => {
+  console.log('>>> HTTP:', req.method, req.url);
+  next();
+});
+
 app.use(express.json({ limit: '15mb' }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -370,7 +376,7 @@ app.post('/chat', async (req, res) => {
     ];
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GOOGLE_GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4455,6 +4461,109 @@ app.get('/api/workout/logs/:workoutId', async (req, res) => {
   }
 });
 
+// ── Workout / set editing ─────────────────────────────────────────────────────
+
+// PUT /api/workout-sets/:setId — update weight_kg and reps_completed
+app.put('/api/workout-sets/:setId', async (req, res) => {
+  try {
+    const { setId } = req.params;
+    const { weight_kg, reps, userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Ownership: set → workout_log → user
+    const { data: setRow, error: setErr } = await supabase
+      .from('workout_set_logs')
+      .select('workout_log_id')
+      .eq('id', setId)
+      .maybeSingle();
+    if (setErr || !setRow) return res.status(404).json({ error: 'Set not found' });
+
+    const { data: logRow, error: logErr } = await supabase
+      .from('workout_logs')
+      .select('user_id')
+      .eq('id', setRow.workout_log_id)
+      .maybeSingle();
+    if (logErr || !logRow) return res.status(404).json({ error: 'Workout not found' });
+    if (logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+    const { error: updateErr } = await supabase
+      .from('workout_set_logs')
+      .update({
+        weight_kg:      parseFloat(weight_kg) || 0,
+        reps_completed: parseInt(reps, 10)    || 0,
+      })
+      .eq('id', setId);
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PUT workout-sets error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/workout-sets/:setId — delete a single set
+app.delete('/api/workout-sets/:setId', async (req, res) => {
+  try {
+    const { setId } = req.params;
+    const userId = req.body?.userId || req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const { data: setRow } = await supabase
+      .from('workout_set_logs')
+      .select('workout_log_id')
+      .eq('id', setId)
+      .maybeSingle();
+    if (!setRow) return res.status(404).json({ error: 'Set not found' });
+
+    const { data: logRow } = await supabase
+      .from('workout_logs')
+      .select('user_id')
+      .eq('id', setRow.workout_log_id)
+      .maybeSingle();
+    if (!logRow || logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+    const { error } = await supabase
+      .from('workout_set_logs')
+      .delete()
+      .eq('id', setId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE workout-sets error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/workouts/:workoutId — delete a workout and all its sets
+app.delete('/api/workouts/:workoutId', async (req, res) => {
+  try {
+    const { workoutId } = req.params;
+    const userId = req.body?.userId || req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const { data: logRow } = await supabase
+      .from('workout_logs')
+      .select('user_id')
+      .eq('id', workoutId)
+      .maybeSingle();
+    if (!logRow) return res.status(404).json({ error: 'Workout not found' });
+    if (logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+
+    // Delete child sets first (in case no CASCADE is set in the schema)
+    await supabase.from('workout_set_logs').delete().eq('workout_log_id', workoutId);
+
+    const { error } = await supabase.from('workout_logs').delete().eq('id', workoutId);
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE workouts error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 require('./trainerRoutes')(app, supabase);
 
 // ── User workout plans ──────────────────────────────────
@@ -4508,7 +4617,7 @@ app.delete('/api/user-plans/:planId', async (req, res) => {
   try {
     const { error } = await supabase
       .from('user_workout_plans')
-      .update({ is_active: false })
+      .delete()
       .eq('id', req.params.planId);
     if (error) throw error;
     res.json({ success: true });
@@ -4657,26 +4766,68 @@ app.post('/api/users/:userId/change-password', async (req, res) => {
 app.delete('/api/users/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    
-    // 1. Soft-delete in users table
-    const { error: updateErr } = await supabase
-      .from('users')
-      .update({ is_active: false })
-      .eq('id', userId);
-      
-    if (updateErr) throw updateErr;
-    
-    // 2. Disable the auth account by banning it
-    const { error: banErr } = await supabase.auth.admin.updateUserById(userId, { 
-      ban_duration: '876000h' 
-    });
-    
-    if (banErr) throw banErr;
-    
-    res.json({ success: true, message: 'Account deactivated' });
+
+    // Verify the requesting user matches the target userId
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ message: 'Unauthorized' });
+    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || authData?.user?.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // Delete workout_set_logs first (FK child of workout_logs)
+    const { data: workoutLogs } = await supabase
+      .from('workout_logs')
+      .select('id')
+      .eq('user_id', userId);
+    const logIds = (workoutLogs || []).map(r => r.id);
+    if (logIds.length) {
+      const { error: e } = await supabase.from('workout_set_logs').delete().in('workout_log_id', logIds);
+      if (e) throw e;
+    }
+
+    const deletes = [
+      supabase.from('workout_logs').delete().eq('user_id', userId),
+      supabase.from('food_logs').delete().eq('user_id', userId),
+      supabase.from('progress_entries').delete().eq('user_id', userId),
+      supabase.from('xp_events').delete().eq('user_id', userId),
+      supabase.from('user_xp').delete().eq('user_id', userId),
+      supabase.from('ai_requests').delete().eq('user_id', userId),
+      supabase.from('assigned_plans').delete().eq('client_id', userId),
+      supabase.from('user_workout_plans').delete().eq('user_id', userId),
+      supabase.from('exercise_bookmarks').delete().eq('user_id', userId),
+      supabase.from('personal_records').delete().eq('user_id', userId),
+      supabase.from('user_macros').delete().eq('user_id', userId),
+      supabase.from('messages').delete().eq('sender_id', userId),
+    ];
+    const results = await Promise.all(deletes);
+    for (const { error: e } of results) { if (e) throw e; }
+
+    // Sequential: conversations and trainer_clients may share FKs
+    const { error: convErr } = await supabase
+      .from('conversations')
+      .delete()
+      .or(`client_id.eq.${userId},trainer_id.eq.${userId}`);
+    if (convErr) throw convErr;
+
+    const { error: tcErr } = await supabase
+      .from('trainer_clients')
+      .delete()
+      .or(`client_id.eq.${userId},trainer_id.eq.${userId}`);
+    if (tcErr) throw tcErr;
+
+    const { error: userErr } = await supabase.from('users').delete().eq('id', userId);
+    if (userErr) throw userErr;
+
+    // Hard-delete the Supabase auth account
+    const { error: deleteErr } = await supabase.auth.admin.deleteUser(userId);
+    if (deleteErr) throw deleteErr;
+
+    res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/users/:userId error:', err);
-    res.status(500).json({ message: err.message || 'Failed to deactivate account' });
+    res.status(500).json({ message: err.message || 'Failed to delete account' });
   }
 });
 
@@ -4726,8 +4877,25 @@ app.use('/api/trainer-earnings', require('./routes/trainerEarningsRoutes'));
 
 app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 
+app.use('/api/ai', require('./src/routes/ai'));
+
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');
+
+// Global error handler — catches any next(err) from middleware or async routes
+app.use((err, req, res, next) => {
+  console.error('=== GLOBAL ERROR HANDLER ===');
+  console.error('Route:', req.method, req.path);
+  console.error('Message:', err.message);
+  console.error('Stack:', err.stack);
+  if (err.cause) console.error('Cause:', err.cause);
+  console.error('============================');
+  if (res.headersSent) return next(err);
+  res.status(err.status || 500).json({
+    error: 'SERVER_ERROR',
+    message: err.message,
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`FitForge backend running on http://localhost:${PORT}`);

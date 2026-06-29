@@ -4,3 +4,5 @@ scripts/test-ecosystem-credentials.md
 scripts/test-results-api.md
 # Added by code-review-graph
 .code-review-graph/
+.env.local
+.env
