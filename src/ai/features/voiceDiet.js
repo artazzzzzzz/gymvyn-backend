@@ -70,7 +70,9 @@ async function parseVoiceDietLog({ userId, audioBuffer, mimeType }) {
 
     // Step 2: Validate transcript
     if (!transcript || transcript.trim().length < 3) {
-      throw { code: 'EMPTY_TRANSCRIPT', message: 'Could not hear anything. Please try again.' };
+      const err = new Error('Could not hear anything. Please try again.');
+      err.code = 'EMPTY_TRANSCRIPT';
+      throw err;
     }
 
     // Step 3: Parse with LLM

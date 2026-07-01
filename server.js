@@ -4071,9 +4071,18 @@ app.delete('/api/food-logs/:logId', async (req, res) => {
 
 // Replaced by foodSearchRoutes.js
 
-// Route 7: POST /api/food-logs/voice
+// Route 7: POST /api/food-logs/voice (legacy — new route is POST /api/ai/voice/diet)
 app.post('/api/food-logs/voice', async (req, res) => {
   try {
+    if (process.env.AI_VOICE_DIET_ENABLED !== 'true') {
+      return res.status(503).json({ error: 'FEATURE_DISABLED', message: 'This feature is currently unavailable.' });
+    }
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !authData?.user) return res.status(401).json({ error: 'Invalid auth token' });
+
     const { userId, transcript, mealType } = req.body;
     if (!userId || !transcript || !mealType) {
       return res.status(400).json({ message: 'userId, transcript, mealType are required' });
