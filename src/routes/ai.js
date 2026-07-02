@@ -6,6 +6,7 @@ const { aiRateLimit } = require('../middleware/aiRateLimit');
 const { parseVoiceDietLog } = require('../ai/features/voiceDiet');
 const { parseFoodPhotos } = require('../ai/features/foodVision');
 const { parseVoiceWorkoutLog } = require('../ai/features/voiceWorkout');
+const { generateDietPlan } = require('../ai/features/dietPlanGeneration');
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -195,15 +196,33 @@ router.post(
 );
 
 // ── POST /api/ai/workout/generate-plan ────────────────────────────────────────
-router.post('/workout/generate-plan', auth, async (req, res) => {
+router.post('/workout/generate-plan', auth, aiRateLimit, async (req, res) => {
   try {
-    const { goal, experience, trainingDays, preferences } = req.body
+    const { goal, experience, trainingDays, preferences, client_user_id } = req.body
     const userId = req.userId
+
+    let targetUserId = userId
+
+    if (client_user_id) {
+      const { data: rel } = await supabase
+        .from('trainer_clients')
+        .select('id')
+        .eq('trainer_id', userId)
+        .eq('client_id', client_user_id)
+        .eq('status', 'active')
+        .maybeSingle()
+
+      if (!rel) {
+        return res.status(403).json({ error: 'NOT_AUTHORIZED', message: 'You are not linked to this client.' })
+      }
+
+      targetUserId = client_user_id
+    }
 
     const { data: profile } = await supabase
       .from('users')
       .select('current_weight, height, age, gender, goal, experience, training_days, priorities')
-      .eq('id', userId)
+      .eq('id', targetUserId)
       .maybeSingle()
 
     const u = profile || {}
@@ -265,5 +284,88 @@ Rules:
     res.status(500).json({ error: err.message || 'Failed to generate plan' })
   }
 })
+
+// ── POST /api/ai/diet/generate-plan ───────────────────────────────────────────
+router.post('/diet/generate-plan', auth, aiRateLimit, async (req, res) => {
+  try {
+    const {
+      client_user_id,
+      goal,
+      dietary_preferences,
+      days = 7,
+      meals_per_day,
+      calorie_goal,
+      protein_goal,
+      carbs_goal,
+      fat_goal,
+    } = req.body;
+
+    if (!client_user_id) {
+      return res.status(400).json({ error: 'client_user_id is required' });
+    }
+
+    const { data: rel } = await supabase
+      .from('trainer_clients')
+      .select('id')
+      .eq('trainer_id', req.userId)
+      .eq('client_id', client_user_id)
+      .eq('status', 'active')
+      .maybeSingle();
+
+    if (!rel) {
+      return res.status(403).json({ error: 'NOT_AUTHORIZED', message: 'You are not linked to this client.' });
+    }
+
+    const { data: client } = await supabase
+      .from('users')
+      .select('calorie_goal, protein_goal, carbs_goal, fat_goal, goal')
+      .eq('id', client_user_id)
+      .maybeSingle();
+
+    const c = client || {};
+    const mealTypes = Array.isArray(meals_per_day) && meals_per_day.length
+      ? meals_per_day
+      : ['breakfast', 'lunch', 'dinner', 'snack'];
+
+    const planData = await generateDietPlan({
+      trainerId: req.userId,
+      goal: goal || c.goal || 'general fitness',
+      dietaryPreferences: dietary_preferences,
+      days: Number(days) || 7,
+      mealTypes,
+      calorieGoal: calorie_goal ?? c.calorie_goal,
+      proteinGoal: protein_goal ?? c.protein_goal,
+      carbsGoal: carbs_goal ?? c.carbs_goal,
+      fatGoal: fat_goal ?? c.fat_goal,
+    });
+
+    // Deactivate any existing active AI diet plan for this client from this trainer
+    await supabase
+      .from('client_diet_plans')
+      .update({ is_active: false })
+      .eq('trainer_id', req.userId)
+      .eq('client_user_id', client_user_id)
+      .eq('is_active', true);
+
+    const { data: saved, error: saveErr } = await supabase
+      .from('client_diet_plans')
+      .insert({
+        trainer_id: req.userId,
+        client_user_id,
+        name: planData.name,
+        description: planData.description,
+        plan_data: planData,
+        is_active: true,
+      })
+      .select()
+      .single();
+    if (saveErr) throw saveErr;
+
+    res.json({ plan: saved });
+  } catch (err) {
+    console.error('[AI diet generate-plan]', err);
+    res.status(500).json({ error: err.message || 'Failed to generate diet plan' });
+  }
+});
 
 module.exports = router;

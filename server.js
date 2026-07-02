@@ -2753,18 +2753,24 @@ app.get('/api/my-gym/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const { data: userRow, error: userErr } = await supabase
-      .from('users')
-      .select('gym_id')
-      .eq('id', userId)
+    // gym_memberships is the source of truth for gym linkage. users.gym_id is a
+    // denormalized convenience field that can go stale (e.g. a join that failed
+    // partway through), so it must never be trusted on its own to decide "active".
+    const { data: membershipRow, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('gym_id, membership_type, status, start_date, end_date')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
-    if (userErr) throw userErr;
+    if (memErr) throw memErr;
 
-    if (!userRow || !userRow.gym_id) {
+    if (!membershipRow) {
       return res.json({ linked: false });
     }
 
-    const gymId = userRow.gym_id;
+    const gymId = membershipRow.gym_id;
 
     const [gymRes, announcementsRes, scheduleRes] = await Promise.all([
       supabase
@@ -2807,6 +2813,11 @@ app.get('/api/my-gym/:userId', async (req, res) => {
     res.json({
       linked: true,
       gym: gymRes.data || null,
+      membership: {
+        membership_type: membershipRow.membership_type || null,
+        start_date: membershipRow.start_date || null,
+        end_date: membershipRow.end_date || null,
+      },
       announcements: announcementsRes.data || [],
       schedule: schedule.map(s => ({ ...s, trainer_name: nameById.get(s.trainer_id) || null })),
     });
@@ -2843,6 +2854,31 @@ app.post('/api/gym-join', async (req, res) => {
       .eq('id', user_id)
       .maybeSingle();
     if (existingErr) throw existingErr;
+
+    // gym_memberships is the source of truth for "is this user a member of this
+    // gym" (owner's member list, My Gym tab). Write it BEFORE users.gym_id so a
+    // failed membership insert can never leave users.gym_id pointing at a gym
+    // the user isn't actually a member of.
+    const { data: existingMembership, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('id')
+      .eq('gym_id', gym.id)
+      .eq('user_id', user_id)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+
+    if (!existingMembership) {
+      const { error: memErr } = await supabase
+        .from('gym_memberships')
+        .insert({
+          gym_id: gym.id,
+          user_id,
+          status: 'active',
+          start_date: new Date().toISOString().slice(0, 10),
+          metadata: { source: 'join_code' },
+        });
+      if (memErr) throw memErr;
+    }
 
     const update = { gym_id: gym.id };
     if (existing?.role !== 'gym_owner') update.role = 'gym_member';
@@ -4894,6 +4930,8 @@ app.use('/api/trainer-earnings', require('./routes/trainerEarningsRoutes'));
 app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 
 app.use('/api/ai', require('./src/routes/ai'));
+
+app.use('/api/client-diet-plans', require('./routes/clientDietPlanRoutes'));
 
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');

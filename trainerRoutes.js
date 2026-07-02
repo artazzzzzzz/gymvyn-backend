@@ -14,10 +14,21 @@ module.exports = function (app, supabase) {
     try {
       const {
         userId, bio, specializations, experienceYears,
-        hourlyRate, isIndependent, phone, city, gymId
+        hourlyRate, isIndependent, phone, city, gymId,
+        pricing_models, hourly_rate, monthly_rate, session_rate
       } = req.body;
 
       if (!userId) return res.status(400).json({ error: 'userId required' });
+
+      // Pricing is optional at onboarding (trainer may skip and set it later
+      // from Trainer Settings). Only persist a rate for a model the trainer
+      // actually selected, so an empty/zero input on an unselected model can't
+      // leak into the saved profile.
+      const selectedModels = Array.isArray(pricing_models) ? pricing_models : [];
+      const toRate = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : null;
+      };
 
       // Generate unique invite code
       const { data: codeData } = await supabase.rpc('generate_invite_code');
@@ -31,7 +42,13 @@ module.exports = function (app, supabase) {
           bio: bio || '',
           specializations: specializations || [],
           experience_years: experienceYears || 0,
-          hourly_rate: hourlyRate || null,
+          // hourly_rate stays the canonical column existing readers rely on
+          // (MyTrainer, TrainerSettings, etc.) — kept in sync whenever
+          // 'hourly' is one of the selected pricing models.
+          hourly_rate: selectedModels.includes('hourly') ? toRate(hourly_rate ?? hourlyRate) : null,
+          monthly_rate: selectedModels.includes('monthly') ? toRate(monthly_rate) : null,
+          session_rate: selectedModels.includes('session') ? toRate(session_rate) : null,
+          pricing_models: selectedModels,
           is_independent: isIndependent !== false,
           phone: phone || null,
           city: city || null,
@@ -643,6 +660,27 @@ module.exports = function (app, supabase) {
         .order('created_at', { ascending: false })
         .limit(10);
 
+      // Authoritative starting/current weight — queried independently of the
+      // capped progressEntries list above so the true oldest ("Starting
+      // weight") entry isn't lost for clients with more than 10 logs.
+      const { data: startingWeightEntry } = await supabase
+        .from('progress_entries')
+        .select('weight_kg, logged_at')
+        .eq('user_id', clientId)
+        .not('weight_kg', 'is', null)
+        .order('logged_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      const { data: latestWeightEntry } = await supabase
+        .from('progress_entries')
+        .select('weight_kg, logged_at')
+        .eq('user_id', clientId)
+        .not('weight_kg', 'is', null)
+        .order('logged_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
       // Progress photos (last 5)
       const { data: progressPhotos } = await supabase
         .from('progress_photos')
@@ -680,6 +718,8 @@ module.exports = function (app, supabase) {
         workoutLogs: workoutLogs || [],
         foodLogs: foodLogs || [],
         progressEntries: progressEntries || [],
+        startingWeightEntry: startingWeightEntry || null,
+        latestWeightEntry: latestWeightEntry || null,
         progressPhotos: progressPhotos || [],
         personalRecords: prs || [],
         assignedPlans: assignedPlans || []

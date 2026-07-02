@@ -88,6 +88,31 @@ router.post('/join', auth, async (req, res) => {
     if (gymErr) throw gymErr;
     if (!gym) return res.status(400).json({ error: 'Invalid gym code' });
 
+    // gym_memberships is the source of truth for "is this user a member of this
+    // gym" (owner's member list, My Gym tab). Write it BEFORE users.gym_id so a
+    // failed membership insert can never leave users.gym_id pointing at a gym
+    // the user isn't actually a member of.
+    const { data: existingMembership, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('id')
+      .eq('gym_id', gym.id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+
+    if (!existingMembership) {
+      const { error: memErr } = await supabase
+        .from('gym_memberships')
+        .insert({
+          gym_id: gym.id,
+          user_id: req.user.id,
+          status: 'active',
+          start_date: new Date().toISOString().slice(0, 10),
+          metadata: { source: 'join_code' },
+        });
+      if (memErr) throw memErr;
+    }
+
     const { error: updateErr } = await supabase
       .from('users')
       .update({ gym_id: gym.id })

@@ -25,7 +25,7 @@ router.get('/my-code', auth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('trainer_profiles')
-      .select('id, trainer_code, user_id')
+      .select('id, trainer_code, invite_code, user_id')
       .eq('user_id', req.user.id)
       .maybeSingle();
 
@@ -33,7 +33,9 @@ router.get('/my-code', auth, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'Trainer profile not found' });
 
     if (!data.trainer_code) {
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+      // Reuse the legacy invite_code (from /api/trainer/onboard) if one already
+      // exists, instead of minting a second, unrelated code for the same trainer.
+      const code = data.invite_code || Math.random().toString(36).substring(2, 8).toUpperCase();
       await supabase.from('trainer_profiles').update({ trainer_code: code }).eq('user_id', req.user.id);
       data.trainer_code = code;
     }
@@ -123,10 +125,18 @@ router.post('/join', auth, async (req, res) => {
     const { trainer_code } = req.body;
     if (!trainer_code) return res.status(400).json({ error: 'trainer_code is required' });
 
+    const normalizedCode = trainer_code.trim().toUpperCase();
+    if (!/^[A-Z0-9]{4,10}$/.test(normalizedCode)) {
+      return res.status(400).json({ error: 'Invalid trainer code' });
+    }
+
+    // Trainers onboarded via the legacy /api/trainer/onboard route only have
+    // invite_code set (trainer_code is null until /api/trainer/my-code backfills
+    // it), so a code shown on the trainer's dashboard can live in either column.
     const { data: tp, error: tpErr } = await supabase
       .from('trainer_profiles')
       .select('id, user_id')
-      .eq('trainer_code', trainer_code.trim().toUpperCase())
+      .or(`trainer_code.eq.${normalizedCode},invite_code.eq.${normalizedCode}`)
       .maybeSingle();
 
     if (tpErr) throw tpErr;
