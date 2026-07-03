@@ -3,14 +3,29 @@
 // Import in server.js: require('./trainerRoutes')(app, supabase)
 // ============================================
 
+const { auth } = require('./middleware/auth');
+
 module.exports = function (app, supabase) {
+
+  // Checks for an active trainer_clients row linking the two ids in this
+  // exact direction (trainerId is the trainer, clientId is the client).
+  async function isLinkedPair(trainerId, clientId) {
+    const { data } = await supabase
+      .from('trainer_clients')
+      .select('id')
+      .eq('trainer_id', trainerId)
+      .eq('client_id', clientId)
+      .eq('status', 'active')
+      .maybeSingle();
+    return !!data;
+  }
 
   // ──────────────────────────────────────────
   // TRAINER ONBOARDING & PROFILE
   // ──────────────────────────────────────────
 
   // POST /api/trainer/onboard — become a trainer (from consumer or new)
-  app.post('/api/trainer/onboard', async (req, res) => {
+  app.post('/api/trainer/onboard', auth, async (req, res) => {
     try {
       const {
         userId, bio, specializations, experienceYears,
@@ -19,6 +34,7 @@ module.exports = function (app, supabase) {
       } = req.body;
 
       if (!userId) return res.status(400).json({ error: 'userId required' });
+      if (req.user.id !== userId) return res.status(403).json({ error: 'Not authorized' });
 
       // Pricing is optional at onboarding (trainer may skip and set it later
       // from Trainer Settings). Only persist a rate for a model the trainer
@@ -78,12 +94,18 @@ module.exports = function (app, supabase) {
   });
 
   // GET /api/trainer/profile/:userId
-  app.get('/api/trainer/profile/:userId', async (req, res) => {
+  app.get('/api/trainer/profile/:userId', auth, async (req, res) => {
     try {
+      const { userId } = req.params;
+      if (req.user.id !== userId) {
+        const linked = (await isLinkedPair(req.user.id, userId)) || (await isLinkedPair(userId, req.user.id));
+        if (!linked) return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const { data, error } = await supabase
         .from('trainer_profiles')
         .select('*, users!inner(full_name, goal, experience)')
-        .eq('user_id', req.params.userId)
+        .eq('user_id', userId)
         .single();
 
       if (error) throw error;
@@ -94,8 +116,12 @@ module.exports = function (app, supabase) {
   });
 
   // PATCH /api/trainer/profile/:userId — update profile
-  app.patch('/api/trainer/profile/:userId', async (req, res) => {
+  app.patch('/api/trainer/profile/:userId', auth, async (req, res) => {
     try {
+      if (req.user.id !== req.params.userId) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const updates = { ...req.body, updated_at: new Date().toISOString() };
       delete updates.user_id; // prevent overwriting FK
       delete updates.invite_code; // prevent code tampering
@@ -119,10 +145,11 @@ module.exports = function (app, supabase) {
   // ──────────────────────────────────────────
 
   // POST /api/trainer/invite-client — send invite
-  app.post('/api/trainer/invite-client', async (req, res) => {
+  app.post('/api/trainer/invite-client', auth, async (req, res) => {
     try {
       const { trainerId, clientEmail, clientPhone, gymId, notes } = req.body;
       if (!trainerId) return res.status(400).json({ error: 'trainerId required' });
+      if (req.user.id !== trainerId) return res.status(403).json({ error: 'Not authorized' });
 
       // Generate a short invite code for this specific invite
       const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -170,12 +197,13 @@ module.exports = function (app, supabase) {
   });
 
   // POST /api/trainer/accept-invite — client accepts trainer invite
-  app.post('/api/trainer/accept-invite', async (req, res) => {
+  app.post('/api/trainer/accept-invite', auth, async (req, res) => {
     try {
       const { clientId, inviteCode } = req.body;
       if (!clientId || !inviteCode) {
         return res.status(400).json({ error: 'clientId and inviteCode required' });
       }
+      if (req.user.id !== clientId) return res.status(403).json({ error: 'Not authorized' });
 
       // Find pending invite by code (either from trainer_clients or trainer_profiles)
       // First check trainer_clients for direct invite
@@ -271,14 +299,18 @@ module.exports = function (app, supabase) {
   });
 
   // GET /api/trainer/clients/:trainerId — list all clients
-  app.get('/api/trainer/clients/:trainerId', async (req, res) => {
+  app.get('/api/trainer/clients/:trainerId', auth, async (req, res) => {
     try {
+      if (req.user.id !== req.params.trainerId) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const { data, error } = await supabase
         .from('trainer_clients')
         .select(`
           *,
           client:users!trainer_clients_client_id_fkey(
-            id, full_name, goal, experience, current_weight, 
+            id, full_name, goal, experience, current_weight,
             target_weight, age, gender, created_at
           )
         `)
@@ -338,8 +370,14 @@ module.exports = function (app, supabase) {
   });
 
   // GET /api/trainer/my-trainer/:clientId — client gets their trainer info
-  app.get('/api/trainer/my-trainer/:clientId', async (req, res) => {
+  app.get('/api/trainer/my-trainer/:clientId', auth, async (req, res) => {
     try {
+      const { clientId } = req.params;
+      if (req.user.id !== clientId) {
+        const linked = await isLinkedPair(req.user.id, clientId);
+        if (!linked) return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const { data: rel, error } = await supabase
         .from('trainer_clients')
         .select(`
@@ -348,7 +386,7 @@ module.exports = function (app, supabase) {
             id, full_name
           )
         `)
-        .eq('client_id', req.params.clientId)
+        .eq('client_id', clientId)
         .eq('status', 'active')
         .single();
 
@@ -370,8 +408,21 @@ module.exports = function (app, supabase) {
   });
 
   // PATCH /api/trainer/client/:relationshipId — update status (pause, remove)
-  app.patch('/api/trainer/client/:relationshipId', async (req, res) => {
+  app.patch('/api/trainer/client/:relationshipId', auth, async (req, res) => {
     try {
+      const { relationshipId } = req.params;
+
+      const { data: existingRel, error: fetchErr } = await supabase
+        .from('trainer_clients')
+        .select('id, trainer_id')
+        .eq('id', relationshipId)
+        .single();
+
+      if (fetchErr || !existingRel) return res.status(404).json({ error: 'Relationship not found' });
+      if (existingRel.trainer_id !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const { status, notes } = req.body;
       const { data, error } = await supabase
         .from('trainer_clients')
@@ -380,7 +431,7 @@ module.exports = function (app, supabase) {
           notes: notes || undefined,
           updated_at: new Date().toISOString()
         })
-        .eq('id', req.params.relationshipId)
+        .eq('id', relationshipId)
         .select()
         .single();
 
@@ -396,12 +447,13 @@ module.exports = function (app, supabase) {
   // ──────────────────────────────────────────
 
   // POST /api/trainer/templates — create template
-  app.post('/api/trainer/templates', async (req, res) => {
+  app.post('/api/trainer/templates', auth, async (req, res) => {
     try {
       const { trainerId, type, name, description, templateData, tags } = req.body;
       if (!trainerId || !type || !name) {
         return res.status(400).json({ error: 'trainerId, type, name required' });
       }
+      if (req.user.id !== trainerId) return res.status(403).json({ error: 'Not authorized' });
 
       const { data, error } = await supabase
         .from('trainer_templates')
@@ -424,8 +476,12 @@ module.exports = function (app, supabase) {
   });
 
   // GET /api/trainer/templates/:trainerId?type=workout
-  app.get('/api/trainer/templates/:trainerId', async (req, res) => {
+  app.get('/api/trainer/templates/:trainerId', auth, async (req, res) => {
     try {
+      if (req.user.id !== req.params.trainerId) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       let query = supabase
         .from('trainer_templates')
         .select('*')
@@ -443,15 +499,28 @@ module.exports = function (app, supabase) {
   });
 
   // PATCH /api/trainer/templates/:templateId
-  app.patch('/api/trainer/templates/:templateId', async (req, res) => {
+  app.patch('/api/trainer/templates/:templateId', auth, async (req, res) => {
     try {
+      const { templateId } = req.params;
+
+      const { data: existingTemplate, error: fetchErr } = await supabase
+        .from('trainer_templates')
+        .select('id, trainer_id')
+        .eq('id', templateId)
+        .single();
+
+      if (fetchErr || !existingTemplate) return res.status(404).json({ error: 'Template not found' });
+      if (existingTemplate.trainer_id !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const updates = { ...req.body, updated_at: new Date().toISOString() };
       delete updates.trainer_id;
 
       const { data, error } = await supabase
         .from('trainer_templates')
         .update(updates)
-        .eq('id', req.params.templateId)
+        .eq('id', templateId)
         .select()
         .single();
 
@@ -461,7 +530,7 @@ module.exports = function (app, supabase) {
       const { data: activePlans } = await supabase
         .from('assigned_plans')
         .select('id')
-        .eq('template_id', req.params.templateId)
+        .eq('template_id', templateId)
         .eq('status', 'active');
 
       if (activePlans?.length) {
@@ -472,7 +541,7 @@ module.exports = function (app, supabase) {
             name: updates.name,
             updated_at: new Date().toISOString()
           })
-          .eq('template_id', req.params.templateId)
+          .eq('template_id', templateId)
           .eq('status', 'active');
       }
 
@@ -483,12 +552,25 @@ module.exports = function (app, supabase) {
   });
 
   // DELETE /api/trainer/templates/:templateId
-  app.delete('/api/trainer/templates/:templateId', async (req, res) => {
+  app.delete('/api/trainer/templates/:templateId', auth, async (req, res) => {
     try {
+      const { templateId } = req.params;
+
+      const { data: existingTemplate, error: fetchErr } = await supabase
+        .from('trainer_templates')
+        .select('id, trainer_id')
+        .eq('id', templateId)
+        .single();
+
+      if (fetchErr || !existingTemplate) return res.status(404).json({ error: 'Template not found' });
+      if (existingTemplate.trainer_id !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+
       const { error } = await supabase
         .from('trainer_templates')
         .delete()
-        .eq('id', req.params.templateId);
+        .eq('id', templateId);
 
       if (error) throw error;
       res.json({ success: true });
@@ -502,12 +584,16 @@ module.exports = function (app, supabase) {
   // ──────────────────────────────────────────
 
   // POST /api/trainer/assign-plan — assign a plan to client
-  app.post('/api/trainer/assign-plan', async (req, res) => {
+  app.post('/api/trainer/assign-plan', auth, async (req, res) => {
     try {
       const { trainerId, clientId, templateId, type, name, planData, notes, startsAt, endsAt } = req.body;
       if (!trainerId || !clientId || !type || !name) {
         return res.status(400).json({ error: 'trainerId, clientId, type, name required' });
       }
+      if (req.user.id !== trainerId) return res.status(403).json({ error: 'Not authorized' });
+
+      const linked = await isLinkedPair(trainerId, clientId);
+      if (!linked) return res.status(403).json({ error: 'Not authorized' });
 
       // Deactivate any existing active plan of same type for this client from this trainer
       await supabase
@@ -577,12 +663,18 @@ module.exports = function (app, supabase) {
   });
 
   // GET /api/trainer/assigned-plans/:clientId — get client's assigned plans
-  app.get('/api/trainer/assigned-plans/:clientId', async (req, res) => {
+  app.get('/api/trainer/assigned-plans/:clientId', auth, async (req, res) => {
     try {
+      const { clientId } = req.params;
+      if (req.user.id !== clientId) {
+        const linked = await isLinkedPair(req.user.id, clientId);
+        if (!linked) return res.status(403).json({ error: 'Not authorized' });
+      }
+
       let query = supabase
         .from('assigned_plans')
         .select('*, trainer:users!assigned_plans_trainer_id_fkey(full_name)')
-        .eq('client_id', req.params.clientId)
+        .eq('client_id', clientId)
         .order('created_at', { ascending: false });
 
       if (req.query.status) query = query.eq('status', req.query.status);
@@ -610,9 +702,12 @@ module.exports = function (app, supabase) {
   // ──────────────────────────────────────────
 
   // GET /api/trainer/client-progress/:trainerId/:clientId
-  app.get('/api/trainer/client-progress/:trainerId/:clientId', async (req, res) => {
+  app.get('/api/trainer/client-progress/:trainerId/:clientId', auth, async (req, res) => {
     try {
       const { trainerId, clientId } = req.params;
+      if (req.user.id !== trainerId) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
 
       // Verify trainer-client relationship exists
       const { data: rel } = await supabase
