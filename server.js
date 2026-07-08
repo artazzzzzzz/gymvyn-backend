@@ -11,6 +11,8 @@ const cron = require('node-cron');
 const ml = require('./ml_client');
 const QRCode = require('qrcode');
 const { auth, requireGymOwner } = require('./middleware/auth');
+const { rateLimit } = require('express-rate-limit');
+const { z } = require('zod');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -25,6 +27,70 @@ const allowedOrigins = [
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+// Global: 100 requests/min per IP across all routes.
+// Occupancy polls every 30s (2 req/min) — well within this limit.
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again in a minute.' },
+});
+
+// Tight: 10 attempts per 15 min per IP on auth-sensitive mutation routes.
+// Login/signup are Supabase-side (no Express handler), so this only covers
+// change-password which is the only brute-forceable server route.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
+app.use(globalLimiter);
+
+// ── Input validation helper ───────────────────────────────────────────────────
+
+function validate(schema) {
+  return (req, res, next) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      const message = result.error.issues
+        .map(e => `${e.path.join('.') || 'body'}: ${e.message}`)
+        .join('; ');
+      return res.status(400).json({ error: 'Validation failed', message });
+    }
+    req.body = result.data;
+    next();
+  };
+}
+
+// Membership-plan schemas — price capped at ₹10,00,000, duration at 10 years.
+const membershipPlanCreateSchema = z.object({
+  name:         z.string().trim().min(1, 'name is required'),
+  duration_days: z.number({ invalid_type_error: 'duration_days must be a number' })
+                  .int('duration_days must be an integer')
+                  .positive('duration_days must be positive')
+                  .max(3650, 'duration_days cannot exceed 3650'),
+  price:        z.number({ invalid_type_error: 'price must be a number' })
+                 .positive('price must be a positive number')
+                 .max(1_000_000, 'price exceeds maximum allowed value'),
+  features:     z.array(z.string()).optional().default([]),
+  is_active:    z.boolean().optional().default(true),
+});
+
+// .strict() blocks unknown keys — the PATCH handler spreads req.body directly
+// into the stored JSONB plan object, so unknown keys must be rejected.
+const membershipPlanUpdateSchema = z.object({
+  name:         z.string().trim().min(1).optional(),
+  duration_days: z.number().int().positive().max(3650).optional(),
+  price:        z.number().positive().max(1_000_000).optional(),
+  features:     z.array(z.string()).optional(),
+  is_active:    z.boolean().optional(),
+}).strict('Unknown fields are not allowed');
 
 app.use(express.json({ limit: '15mb' }));
 
@@ -483,7 +549,7 @@ app.delete('/api/gyms/:gymId', auth, requireGymOwner, async (req, res) => {
   }
 });
 
-app.post('/api/gyms/:gymId/membership-plans', auth, requireGymOwner, async (req, res) => {
+app.post('/api/gyms/:gymId/membership-plans', validate(membershipPlanCreateSchema), auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { name, duration_days, price, features, is_active } = req.body;
@@ -546,7 +612,7 @@ app.delete('/api/gyms/:gymId/membership-plans/:planId', auth, requireGymOwner, a
   }
 });
 
-app.patch('/api/gyms/:gymId/membership-plans/:planId', auth, requireGymOwner, async (req, res) => {
+app.patch('/api/gyms/:gymId/membership-plans/:planId', validate(membershipPlanUpdateSchema), auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId, planId } = req.params;
     const updates = req.body;
@@ -4727,8 +4793,6 @@ app.delete('/api/workouts/:workoutId', auth, async (req, res) => {
   }
 });
 
-require('./trainerRoutes')(app, supabase);
-
 // ── User workout plans ──────────────────────────────────
 app.get('/api/user-plans/:userId', auth, async (req, res) => {
   try {
@@ -4944,7 +5008,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
   }
 });
 
-app.post('/api/users/:userId/change-password', auth, async (req, res) => {
+app.post('/api/users/:userId/change-password', authLimiter, auth, async (req, res) => {
   try {
     const { userId } = req.params;
     const { new_password } = req.body;
