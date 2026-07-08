@@ -4,6 +4,7 @@
 // ============================================
 
 const { auth } = require('./middleware/auth');
+const { getOrCreateConversationIfAllowed } = require('./src/utils/canMessage');
 
 module.exports = function (app, supabase) {
 
@@ -181,12 +182,12 @@ module.exports = function (app, supabase) {
 
       if (error) throw error;
 
-      // If client exists, create conversation
+      // If client exists, create conversation. The real conversations table
+      // uses participant_1_id/participant_2_id (this insert used to target
+      // trainer_id/client_id, columns that no longer exist — it was silently
+      // failing since the result wasn't checked for an error).
       if (clientId) {
-        await supabase.from('conversations').insert({
-          trainer_id: trainerId,
-          client_id: clientId
-        });
+        await getOrCreateConversationIfAllowed(supabase, trainerId, clientId);
       }
 
       res.json({ success: true, invite: data, inviteCode });
@@ -273,11 +274,10 @@ module.exports = function (app, supabase) {
         invite.status = 'active';
       }
 
-      // Create conversation for this pair
-      await supabase.from('conversations').upsert({
-        trainer_id: invite.trainer_id,
-        client_id: clientId
-      }, { onConflict: 'trainer_id,client_id' });
+      // Create conversation for this pair (get_or_create_conversation is
+      // itself idempotent on the participant pair, replacing the old
+      // upsert-by-trainer_id/client_id which targeted nonexistent columns).
+      await getOrCreateConversationIfAllowed(supabase, invite.trainer_id, clientId);
 
       // Update trainer total_clients count
       const { count } = await supabase
@@ -627,31 +627,41 @@ module.exports = function (app, supabase) {
         await supabase.rpc('increment_template_assigned', { tid: templateId });
       }
 
-      // Send system message in chat
-      const { data: convo } = await supabase
-        .from('conversations')
-        .select('id')
-        .eq('trainer_id', trainerId)
-        .eq('client_id', clientId)
-        .single();
+      // Send system message in chat. This previously looked up the
+      // conversation by trainer_id/client_id, columns that don't exist on
+      // the real table (participant_1_id/participant_2_id) — the lookup's
+      // error was never checked, so this whole block silently no-op'd.
+      // trainer-client eligibility was already confirmed above via
+      // isLinkedPair, so this always succeeds; get_or_create_conversation is
+      // idempotent if one already exists from the invite/accept flow.
+      const convoId = await getOrCreateConversationIfAllowed(supabase, trainerId, clientId);
 
-      if (convo) {
+      if (convoId) {
+        // messages has no message_type/metadata columns in the real schema —
+        // the plan_share rich-message rendering ChatWindow.jsx expects isn't
+        // backed by any column today; out of scope for this permission fix,
+        // flagging rather than inventing a schema change here.
         await supabase.from('messages').insert({
-          conversation_id: convo.id,
+          conversation_id: convoId,
           sender_id: trainerId,
           content: `Assigned new ${type} plan: ${name}`,
-          message_type: 'plan_share',
-          metadata: { plan_id: data.id, plan_type: type }
         });
+
+        const { data: convo } = await supabase
+          .from('conversations')
+          .select('participant_1_id')
+          .eq('id', convoId)
+          .single();
 
         await supabase.from('conversations').update({
           last_message_at: new Date().toISOString(),
           last_message_preview: `New ${type} plan: ${name}`
-        }).eq('id', convo.id);
+        }).eq('id', convoId);
 
+        const clientIsP1 = convo?.participant_1_id === clientId;
         await supabase.rpc('increment_unread', {
-          convo_id: convo.id,
-          field_name: 'client_unread'
+          convo_id: convoId,
+          field_name: clientIsP1 ? 'p1_unread' : 'p2_unread'
         });
       }
 

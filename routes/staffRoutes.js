@@ -1,5 +1,6 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const { auth: authenticateToken, requireGymOwner, requireStaffRole } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -18,52 +19,6 @@ const PERMISSION_KEYS = [
   'view_supplements',
   'view_announcements',
 ];
-
-// ── Middleware ─────────────────────────────────────────────────────────────────
-
-async function authenticateToken(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
-
-async function requireGymOwner(req, res, next) {
-  const gymId = req.params.gymId;
-  if (!gymId) return res.status(400).json({ error: 'gymId param required' });
-
-  const { data, error } = await supabase
-    .from('gyms')
-    .select('id')
-    .eq('id', gymId)
-    .eq('owner_id', req.user.id)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(403).json({ error: 'You do not own this gym' });
-
-  next();
-}
-
-async function requireStaffRole(req, res, next) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('role')
-    .eq('id', req.user.id)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data || data.role !== 'staff') {
-    return res.status(403).json({ error: 'Staff role required' });
-  }
-
-  next();
-}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -309,7 +264,13 @@ router.get('/gym/:gymId/code', authenticateToken, requireGymOwner, async (req, r
 
     if (error) throw error;
 
-    res.json({ staffCode: data.staff_code });
+    let staffCode = data.staff_code;
+    if (!staffCode) {
+      staffCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      await supabase.from('gyms').update({ staff_code: staffCode }).eq('id', req.params.gymId);
+    }
+
+    res.json({ staffCode });
   } catch (err) {
     console.error('GET /api/staff/gym/:gymId/code error:', err);
     res.status(500).json({ error: err.message });

@@ -142,13 +142,15 @@ router.post('/assign', auth, async (req, res) => {
   try {
     const body = req.body;
 
-    // Verify client belongs to this trainer
+    // Verify client is a CURRENTLY active client of this trainer — a stale
+    // 'removed' row from a client who unlinked must not authorize this.
     const { data: clientRow, error: clientErr } = await supabase
       .from('trainer_clients')
       .select('id')
       .eq('trainer_id', req.user.id)
       .eq('client_id', body.client_id)
-      .single();
+      .eq('status', 'active')
+      .maybeSingle();
     if (clientErr || !clientRow) {
       return res.status(403).json({ error: 'Not your client' });
     }

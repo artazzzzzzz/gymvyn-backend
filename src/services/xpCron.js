@@ -2,6 +2,8 @@ const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
 const { generateWeeklyChallenges } = require('../utils/challengeGenerator');
 const { applyWeeklyMuscleSkipPenalty, calculateE1RM } = require('./xpEngine');
+const { XP_CONSTANTS } = require('../utils/xpCalculator');
+const { MONTHLY_FREEZES } = XP_CONSTANTS;
 
 function getSupabase() {
   return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -62,7 +64,7 @@ async function runDailyStreakCheck() {
 
       // Safety-net freeze reset (also done per-user in updateDailyActivity)
       if (row.freezes_reset_at && row.freezes_reset_at < firstOfMonth) {
-        updates.freezes_remaining = 6;
+        updates.freezes_remaining = MONTHLY_FREEZES;
         updates.freezes_reset_at = firstOfMonth;
         freezeReset++;
       }
@@ -244,7 +246,7 @@ async function runMonthlyFreezeReset() {
 
     const { error, count } = await supabase
       .from('user_xp')
-      .update({ freezes_remaining: 6, freezes_reset_at: firstOfMonth })
+      .update({ freezes_remaining: MONTHLY_FREEZES, freezes_reset_at: firstOfMonth })
       .lt('freezes_reset_at', firstOfMonth)
       .select('user_id', { count: 'exact', head: true });
 

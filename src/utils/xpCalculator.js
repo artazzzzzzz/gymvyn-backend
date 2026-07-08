@@ -9,7 +9,7 @@ const XP_CONSTANTS = {
   DAILY_ACTIVE_XP: 10,
   COMMUNITY_POST_XP: 5,
   MAX_COMMUNITY_XP_PER_DAY: 15,
-  MONTHLY_FREEZES: 6,
+  MONTHLY_FREEZES: 9,
   MUSCLE_GROUPS: ['chest', 'back', 'shoulders', 'legs', 'arms', 'core'],
   LEVEL_NAMES: {
     1: 'Rookie', 2: 'Rookie', 3: 'Rookie',

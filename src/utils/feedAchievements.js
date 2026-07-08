@@ -15,12 +15,14 @@ async function postAchievement({ gymId, userId, content }) {
 
   if (!user?.share_achievements) return;
 
-  // Verify user is a member of this gym
+  // Verify user is a CURRENT (active) member of this gym — a stale row from
+  // a gym they've since unlinked from must not authorize a feed post there.
   const { data: membership } = await supabase
     .from('gym_memberships')
     .select('id')
     .eq('gym_id', gymId)
     .eq('user_id', userId)
+    .eq('status', 'active')
     .maybeSingle();
 
   if (!membership) return;

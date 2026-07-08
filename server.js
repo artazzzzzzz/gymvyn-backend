@@ -10,18 +10,20 @@ const { parse: parseCsvSync } = require('csv-parse/sync');
 const cron = require('node-cron');
 const ml = require('./ml_client');
 const QRCode = require('qrcode');
+const { auth, requireGymOwner } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const allowedOrigins = [
-  process.env.FRONTEND_URL || 'https://fitforge-frontend.vercel.app',
+  process.env.FRONTEND_URL || 'https://gymvyn-frontend.vercel.app',
+  'https://gymvyn-admin.vercel.app',
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:3000',
 ];
 
-app.use(cors());
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 
 // Top-level request probe — remove once 500 is diagnosed
 app.use((req, res, next) => {
@@ -88,248 +90,14 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.post('/generate-workout-plan', async (req, res) => {
-  try {
-    const {
-      userId,
-      goal,
-      experience,
-      equipment,
-      injuries,
-      // accept both naming conventions from the frontend profile spread
-      daysPerWeek,
-      training_days,
-    } = req.body;
-
-    const days = daysPerWeek ?? training_days;
-
-    if (!userId || !goal || !experience || !equipment || !days) {
-      return res.status(400).json({
-        message: 'Missing required fields: userId, goal, experience, equipment, training_days',
-      });
-    }
-
-    const prompt = `You are an expert fitness coach. Generate a ${days}-day per week workout plan for a gym goer.
-
-User Profile:
-- Goal: ${goal}
-- Experience: ${experience}
-- Equipment: ${equipment}
-- Days per week: ${days}
-- Injuries/limitations: ${injuries || 'None'}
-
-Return ONLY a valid JSON object — no markdown, no extra text — in this exact format:
-{
-  "planName": "string",
-  "weeklyStructure": [
-    {
-      "dayNumber": 1,
-      "dayName": "Monday",
-      "focus": "Chest & Triceps",
-      "isRestDay": false,
-      "exercises": [
-        {
-          "name": "Barbell Bench Press",
-          "sets": 4,
-          "reps": "8-10",
-          "restSeconds": 90,
-          "notes": "Focus on full range of motion"
-        }
-      ]
-    }
-  ],
-  "generalTips": ["tip1", "tip2", "tip3"]
-}
-
-Rules:
-- weeklyStructure must have exactly 7 entries (one per day of the week)
-- Rest days must have isRestDay: true and an empty exercises array
-- Non-training days beyond the ${days} days/week must be rest days
-- Reps can be a range like "8-10" or a number like "12"
-- Match exercises strictly to available equipment: ${equipment}`;
-
-    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-
-    const planData = extractJson(responseText);
-    const normalized = normalizePlan(planData);
-
-    // Deactivate any existing active plans for this user
-    await supabase
-      .from('workout_plans')
-      .update({ is_active: false })
-      .eq('user_id', userId)
-      .eq('is_active', true);
-
-    const { error: insertError } = await supabase
-      .from('workout_plans')
-      .insert({
-        user_id: userId,
-        goal,
-        days_per_week: days,
-        plan_data: planData,
-        is_active: true,
-      });
-
-    if (insertError) throw insertError;
-
-    res.json(normalized);
-
-  } catch (err) {
-    console.error('Generate workout plan error:', err);
-    res.status(500).json({ message: err.message || 'Failed to generate workout plan' });
-  }
-});
-
-app.get('/workout-plan/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const { data, error } = await supabase
-      .from('workout_plans')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('is_active', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error) {
-      // PGRST116 = no rows found
-      if (error.code === 'PGRST116') return res.status(404).json({ message: 'No active plan' });
-      throw error;
-    }
-
-    res.json(normalizePlan(data.plan_data));
-
-  } catch (err) {
-    console.error('Get workout plan error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch workout plan' });
-  }
-});
-
-app.get('/diet-plan/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const { data, error } = await supabase
-      .from('diet_plans')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ message: 'No diet plan found' });
-      throw error;
-    }
-
-    res.json(data.plan_data);
-
-  } catch (err) {
-    console.error('Get diet plan error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch diet plan' });
-  }
-});
-
-app.post('/generate-diet-plan', async (req, res) => {
-  try {
-    const { userId, weight, height, age, gender, activityLevel, goal } = req.body;
-
-    if (!userId || !weight || !height || !age || !gender || !activityLevel || !goal) {
-      return res.status(400).json({
-        message: 'Missing required fields: userId, weight, height, age, gender, activityLevel, goal',
-      });
-    }
-
-    const bmr = gender === 'male'
-      ? 10 * weight + 6.25 * height - 5 * age + 5
-      : 10 * weight + 6.25 * height - 5 * age - 161;
-
-    const activityMultipliers = {
-      sedentary: 1.2,
-      light: 1.375,
-      moderate: 1.55,
-      active: 1.725,
-      very_active: 1.9,
-    };
-
-    const goalAdjustments = { lose: -300, maintain: 0, gain: 300 };
-
-    const tdee = Math.round(bmr * (activityMultipliers[activityLevel] ?? 1.2));
-    const targetCalories = tdee + (goalAdjustments[goal] ?? 0);
-
-    const prompt = `You are a certified Indian nutritionist. Generate a 7-day Indian meal plan for a person with these stats:
-- Weight: ${weight}kg, Height: ${height}cm, Age: ${age}, Gender: ${gender}
-- Activity level: ${activityLevel}, Goal: ${goal}
-- TDEE: ${tdee} kcal/day, Target calories: ${targetCalories} kcal/day
-
-Return ONLY a valid JSON object — no markdown, no extra text — in this exact format:
-{
-  "tdee": ${tdee},
-  "targetCalories": ${targetCalories},
-  "macros": {
-    "protein": <grams>,
-    "carbs": <grams>,
-    "fat": <grams>
-  },
-  "weekPlan": [
-    {
-      "day": "Monday",
-      "meals": [
-        {
-          "name": "Breakfast",
-          "time": "8:00 AM",
-          "foods": [
-            { "item": "Oats upma", "quantity": "1 bowl (200g)", "calories": 250 }
-          ],
-          "totalCalories": 250
-        }
-      ]
-    }
-  ]
-}
-
-Rules:
-- weekPlan must have exactly 7 days
-- Each day must have meals: Breakfast, Mid-Morning Snack, Lunch, Evening Snack, Dinner
-- Use authentic Indian foods (dal, sabzi, roti, rice, idli, dosa, poha, etc.)
-- Calories across all meals in a day should sum close to ${targetCalories}
-- Macros: protein ~${Math.round(targetCalories * 0.3 / 4)}g, carbs ~${Math.round(targetCalories * 0.45 / 4)}g, fat ~${Math.round(targetCalories * 0.25 / 9)}g`;
-
-    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-
-    const dietPlan = extractJson(responseText);
-
-    const { error: insertError } = await supabase
-      .from('diet_plans')
-      .insert({
-        user_id: userId,
-        plan_data: dietPlan,
-        created_at: new Date().toISOString(),
-      });
-
-    if (insertError) throw insertError;
-
-    res.json(dietPlan);
-
-  } catch (err) {
-    console.error('Generate diet plan error:', err);
-    res.status(500).json({ message: err.message || 'Failed to generate diet plan' });
-  }
-});
-
-app.post('/upload-progress-photo', upload.single('photo'), async (req, res) => {
+app.post('/upload-progress-photo', auth, upload.single('photo'), async (req, res) => {
   try {
     const { userId, date, notes, angle } = req.body;
 
     if (!userId || !req.file) {
       return res.status(400).json({ message: 'Missing required fields: userId, photo' });
     }
+    if (userId !== req.user.id) return res.status(403).json({ message: 'Forbidden' });
 
     const photo_url = req.file.path;
     const cloudinary_id = req.file.filename;
@@ -349,9 +117,10 @@ app.post('/upload-progress-photo', upload.single('photo'), async (req, res) => {
   }
 });
 
-app.get('/progress-photos/:userId', async (req, res) => {
+app.get('/progress-photos/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (userId !== req.user.id) return res.status(403).json({ message: 'Forbidden' });
 
     const { data, error } = await supabase
       .from('progress_photos')
@@ -368,7 +137,7 @@ app.get('/progress-photos/:userId', async (req, res) => {
   }
 });
 
-app.post('/chat', async (req, res) => {
+app.post('/chat', auth, async (req, res) => {
   try {
     const { message, history = [], userProfile = {} } = req.body;
 
@@ -383,7 +152,7 @@ app.post('/chat', async (req, res) => {
     ];
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GOOGLE_GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -404,205 +173,20 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// ── Community routes ──────────────────────────────────────────────────────────
-
-app.get('/posts', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('posts')
-      .select(`
-        *,
-        users!posts_user_id_fkey ( id, full_name )
-      `)
-      .order('created_at', { ascending: false })
-      .limit(50);
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error('GET /posts error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch posts' });
-  }
-});
-
-app.post('/posts', async (req, res) => {
-  try {
-    const { user_id, content, image_url, post_type } = req.body;
-
-    if (!user_id || !content) {
-      return res.status(400).json({ message: 'Missing required fields: user_id, content' });
-    }
-
-    const { data, error } = await supabase
-      .from('posts')
-      .insert({ user_id, content, image_url, post_type })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (err) {
-    console.error('POST /posts error:', err);
-    res.status(500).json({ message: err.message || 'Failed to create post' });
-  }
-});
-
-app.post('/posts/:postId/like', async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const { user_id } = req.body;
-
-    if (!user_id) return res.status(400).json({ message: 'Missing required field: user_id' });
-
-    const { data: existing } = await supabase
-      .from('post_likes')
-      .select('id')
-      .eq('post_id', postId)
-      .eq('user_id', user_id)
-      .maybeSingle();
-
-    let liked;
-    if (existing) {
-      await supabase.from('post_likes').delete().eq('id', existing.id);
-      liked = false;
-    } else {
-      await supabase.from('post_likes').insert({ post_id: postId, user_id });
-      liked = true;
-    }
-
-    const { count } = await supabase
-      .from('post_likes')
-      .select('*', { count: 'exact', head: true })
-      .eq('post_id', postId);
-
-    await supabase.from('posts').update({ likes_count: count }).eq('id', postId);
-
-    res.json({ liked, likes_count: count });
-  } catch (err) {
-    console.error('POST /posts/:postId/like error:', err);
-    res.status(500).json({ message: err.message || 'Failed to toggle like' });
-  }
-});
-
-app.post('/posts/:postId/comments', async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const { user_id, content } = req.body;
-
-    if (!user_id || !content) {
-      return res.status(400).json({ message: 'Missing required fields: user_id, content' });
-    }
-
-    const { data: comment, error: commentError } = await supabase
-      .from('post_comments')
-      .insert({ post_id: postId, user_id, content })
-      .select()
-      .single();
-
-    if (commentError) throw commentError;
-
-    const { count } = await supabase
-      .from('post_comments')
-      .select('*', { count: 'exact', head: true })
-      .eq('post_id', postId);
-
-    await supabase.from('posts').update({ comments_count: count }).eq('id', postId);
-
-    res.status(201).json(comment);
-  } catch (err) {
-    console.error('POST /posts/:postId/comments error:', err);
-    res.status(500).json({ message: err.message || 'Failed to add comment' });
-  }
-});
-
-app.get('/posts/:postId/comments', async (req, res) => {
-  try {
-    const { postId } = req.params;
-
-    const { data, error } = await supabase
-      .from('post_comments')
-      .select(`
-        *,
-        users!post_comments_user_id_fkey ( id, full_name )
-      `)
-      .eq('post_id', postId)
-      .order('created_at', { ascending: true });
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error('GET /posts/:postId/comments error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch comments' });
-  }
-});
-
-app.get('/leaderboard', async (req, res) => {
-  try {
-    // Top 10 by streak — streak lives on user_xp.current_streak, not users.
-    const { data, error } = await supabase
-      .from('user_xp')
-      .select('current_streak, total_xp, level, users!inner(id, full_name)')
-      .order('current_streak', { ascending: false })
-      .limit(10);
-
-    if (error) throw error;
-    const flattened = (data || []).map((row) => ({
-      id: row.users.id,
-      full_name: row.users.full_name,
-      current_streak: row.current_streak,
-      total_xp: row.total_xp,
-      level: row.level,
-    }));
-    res.json(flattened);
-  } catch (err) {
-    console.error('GET /leaderboard error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch leaderboard' });
-  }
-});
-
-app.get('/buddy-suggestions/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const { data: existingRequests } = await supabase
-      .from('buddy_requests')
-      .select('sender_id, receiver_id')
-      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`);
-
-    const excludedIds = new Set([userId]);
-    (existingRequests || []).forEach(r => {
-      excludedIds.add(r.sender_id);
-      excludedIds.add(r.receiver_id);
-    });
-
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, full_name, goal')
-      .not('id', 'in', `(${[...excludedIds].join(',')})`)
-      .limit(20);
-
-    if (error) throw error;
-
-    const shuffled = (data || []).sort(() => Math.random() - 0.5).slice(0, 5);
-    res.json(shuffled);
-  } catch (err) {
-    console.error('GET /buddy-suggestions/:userId error:', err);
-    res.status(500).json({ message: err.message || 'Failed to fetch buddy suggestions' });
-  }
-});
-
 // ── Gym owner routes ──────────────────────────────────────────────────────────
 
-app.post('/api/gyms', async (req, res) => {
+app.post('/api/gyms', auth, async (req, res) => {
   try {
-    const { 
-      user_id, name, city, gym_type, 
-      address, phone, description, 
-      operating_hours, membership_plans 
+    const {
+      name, city, gym_type,
+      address, phone, description,
+      operating_hours, membership_plans
     } = req.body;
+    // Owner is always the authenticated caller — never trust a user_id from the body.
+    const user_id = req.user.id;
 
-    if (!user_id || !name || !city || !gym_type) {
-      return res.status(400).json({ message: 'Missing required fields: user_id, name, city, and gym_type are required' });
+    if (!name || !city || !gym_type) {
+      return res.status(400).json({ message: 'Missing required fields: name, city, and gym_type are required' });
     }
 
     const { data: existingGym, error: checkErr } = await supabase
@@ -635,7 +219,8 @@ app.post('/api/gyms', async (req, res) => {
     };
 
     const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
+    const staffCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+
     const { data: createdGymRow, error: insertErr } = await supabase
       .from('gyms')
       .insert({
@@ -652,6 +237,7 @@ app.post('/api/gyms', async (req, res) => {
         notifications: DEFAULT_NOTIFICATIONS,
         is_active: true,
         join_code: joinCode,
+        staff_code: staffCode,
         created_at: new Date().toISOString()
       })
       .select()
@@ -708,9 +294,12 @@ app.post('/api/gyms', async (req, res) => {
 });
 
 // Idempotency check — always 200; gym: null means not set up yet
-app.get('/api/gyms/owner/:userId', async (req, res) => {
+app.get('/api/gyms/owner/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (req.user.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('gyms')
       .select('*')
@@ -726,9 +315,12 @@ app.get('/api/gyms/owner/:userId', async (req, res) => {
   }
 });
 
-app.get('/api/gyms/:userId', async (req, res) => {
+app.get('/api/gyms/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (req.user.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('gyms')
       .select('*')
@@ -779,7 +371,7 @@ function applyGymSettingsDefaults(row) {
   };
 }
 
-app.get('/api/gyms/:gymId/settings', async (req, res) => {
+app.get('/api/gyms/:gymId/settings', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { data, error } = await supabase
@@ -796,7 +388,7 @@ app.get('/api/gyms/:gymId/settings', async (req, res) => {
   }
 });
 
-app.patch('/api/gyms/:gymId/settings', async (req, res) => {
+app.patch('/api/gyms/:gymId/settings', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     const body = req.body || {};
@@ -839,7 +431,7 @@ app.patch('/api/gyms/:gymId/settings', async (req, res) => {
 
 const logoMemUpload = multer({ storage: multer.memoryStorage() });
 
-app.post('/api/gyms/:gymId/upload-logo', logoMemUpload.single('logo'), async (req, res) => {
+app.post('/api/gyms/:gymId/upload-logo', auth, requireGymOwner, logoMemUpload.single('logo'), async (req, res) => {
   const { gymId } = req.params;
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
@@ -873,7 +465,7 @@ app.post('/api/gyms/:gymId/upload-logo', logoMemUpload.single('logo'), async (re
   }
 });
 
-app.delete('/api/gyms/:gymId', async (req, res) => {
+app.delete('/api/gyms/:gymId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     
@@ -896,7 +488,7 @@ app.delete('/api/gyms/:gymId', async (req, res) => {
   }
 });
 
-app.post('/api/gyms/:gymId/membership-plans', async (req, res) => {
+app.post('/api/gyms/:gymId/membership-plans', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { name, duration_days, price, features, is_active } = req.body;
@@ -932,7 +524,7 @@ app.post('/api/gyms/:gymId/membership-plans', async (req, res) => {
   }
 });
 
-app.delete('/api/gyms/:gymId/membership-plans/:planId', async (req, res) => {
+app.delete('/api/gyms/:gymId/membership-plans/:planId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId, planId } = req.params;
     
@@ -959,7 +551,7 @@ app.delete('/api/gyms/:gymId/membership-plans/:planId', async (req, res) => {
   }
 });
 
-app.patch('/api/gyms/:gymId/membership-plans/:planId', async (req, res) => {
+app.patch('/api/gyms/:gymId/membership-plans/:planId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId, planId } = req.params;
     const updates = req.body;
@@ -997,7 +589,7 @@ const TYPE_DURATION_DAYS = {
   monthly: 30, quarterly: 90, half_yearly: 180, annual: 365,
 };
 
-app.post('/api/gym-members', async (req, res) => {
+app.post('/api/gym-members', auth, async (req, res) => {
   try {
     // Accept both snake_case (new spec) and camelCase (legacy frontend) keys.
     const {
@@ -1022,6 +614,9 @@ app.post('/api/gym-members', async (req, res) => {
 
     // ── Validation ──────────────────────────────────────────────────
     if (!gymIdVal)                              return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gymIdVal))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     if (!fullNameVal || !fullNameVal.trim())    return res.status(400).json({ message: 'full_name is required' });
     if (!phone || !phone.trim())                return res.status(400).json({ message: 'phone is required' });
     if (!/^\d{10}$/.test(phone.trim()))         return res.status(400).json({ message: 'phone must be 10 digits' });
@@ -1124,10 +719,13 @@ app.post('/api/gym-members', async (req, res) => {
 
 const csvUpload = multer({ storage: multer.memoryStorage() });
 
-app.post('/api/gym-members/csv-import', csvUpload.single('file'), async (req, res) => {
+app.post('/api/gym-members/csv-import', auth, csvUpload.single('file'), async (req, res) => {
   try {
     const gymId = req.body.gym_id || req.body.gymId;
     if (!gymId) return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gymId))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     if (!req.file) return res.status(400).json({ message: 'CSV file is required' });
 
     let records;
@@ -1217,11 +815,14 @@ app.post('/api/gym-members/csv-import', csvUpload.single('file'), async (req, re
 // Lightweight "add member by name + phone" — no membership_type or fee required.
 // Looks up an existing user by phone; if none found, creates a profile-only row.
 
-app.post('/api/gym-members/manual', async (req, res) => {
+app.post('/api/gym-members/manual', auth, async (req, res) => {
   try {
     const { gym_id, full_name, phone, plan_name } = req.body;
 
     if (!gym_id)                          return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     if (!full_name || !full_name.trim())  return res.status(400).json({ message: 'full_name is required' });
     if (phone && !/^\d{10}$/.test(phone.trim())) {
       return res.status(400).json({ message: 'phone must be 10 digits' });
@@ -1243,16 +844,38 @@ app.post('/api/gym-members/manual', async (req, res) => {
       if (lookupErr) throw lookupErr;
 
       if (existingUser) {
-        // Check not already a member of this gym
+        // Check not already an ACTIVE member of this gym — a formerly-unlinked
+        // (status != 'active') row must not block re-adding the same person.
         const { data: existingMem, error: memLookupErr } = await supabase
           .from('gym_memberships')
-          .select('id')
+          .select('id, status')
           .eq('gym_id', gym_id)
           .eq('user_id', existingUser.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
           .maybeSingle();
         if (memLookupErr) throw memLookupErr;
-        if (existingMem) {
+        if (existingMem?.status === 'active') {
           return res.status(409).json({ message: 'This phone number is already a member of your gym' });
+        }
+        if (existingMem) {
+          // Reactivate the existing (inactive) row instead of inserting a
+          // duplicate — keeps a single membership row per gym+user pair.
+          const { error: reactivateErr } = await supabase
+            .from('gym_memberships')
+            .update({
+              status: 'active',
+              membership_type: plan_name || 'manual',
+              start_date: new Date().toISOString().slice(0, 10),
+              end_date: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existingMem.id);
+          if (reactivateErr) throw reactivateErr;
+
+          await supabase.from('users').update({ gym_id, role: 'gym_member' }).eq('id', existingUser.id);
+
+          return res.status(201).json({ success: true, user_id: existingUser.id, membership_id: existingMem.id });
         }
         userId = existingUser.id;
       }
@@ -1311,10 +934,13 @@ app.post('/api/gym-members/manual', async (req, res) => {
 // Bulk import from CSV. Each member: { full_name, phone, email, plan_name }
 // Looks up existing users by phone or email; creates pending profiles otherwise.
 
-app.post('/api/gym-members/import', async (req, res) => {
+app.post('/api/gym-members/import', auth, async (req, res) => {
   try {
     const { gym_id, members } = req.body;
     if (!gym_id)                   return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     if (!Array.isArray(members) || !members.length) {
       return res.status(400).json({ message: 'members array is required' });
     }
@@ -1397,7 +1023,75 @@ const PLAN_TYPE_LABELS = {
   annual:      'Annual',
 };
 
-app.get('/api/gym-members', async (req, res) => {
+// Shared owner/staff access helpers for gym-scoped routes below.
+async function isGymOwner(userId, gymId) {
+  const { data } = await supabase
+    .from('gyms')
+    .select('id')
+    .eq('id', gymId)
+    .eq('owner_id', userId)
+    .maybeSingle();
+  return !!data;
+}
+
+async function getActiveGymStaffRow(userId, gymId) {
+  const { data } = await supabase
+    .from('gym_staff')
+    .select('id')
+    .eq('gym_id', gymId)
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .maybeSingle();
+  return data;
+}
+
+async function staffHasPaymentAccess(staffId) {
+  const { data } = await supabase
+    .from('staff_permissions')
+    .select('permission_key')
+    .eq('staff_id', staffId)
+    .in('permission_key', ['view_payments', 'collect_payment'])
+    .eq('enabled', true);
+  return (data || []).length > 0;
+}
+
+async function staffHasPermission(staffId, permissionKeys) {
+  const { data } = await supabase
+    .from('staff_permissions')
+    .select('permission_key')
+    .eq('staff_id', staffId)
+    .in('permission_key', permissionKeys)
+    .eq('enabled', true);
+  return (data || []).length > 0;
+}
+
+// Member-facing gym-scoped reads (occupancy, schedule) are visible to any
+// currently-active member of the gym, not just owner/staff.
+async function isActiveGymMember(userId, gymId) {
+  const { data } = await supabase
+    .from('gym_memberships')
+    .select('id')
+    .eq('gym_id', gymId)
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .maybeSingle();
+  return !!data;
+}
+
+// A trainer may read (but not write) a client's logs — mirrors the active
+// trainer_clients relationship already used elsewhere in this file.
+async function isActiveTrainerOfClient(trainerId, clientId) {
+  const { data } = await supabase
+    .from('trainer_clients')
+    .select('id')
+    .eq('trainer_id', trainerId)
+    .eq('client_id', clientId)
+    .eq('status', 'active')
+    .maybeSingle();
+  return !!data;
+}
+
+app.get('/api/gym-members', auth, async (req, res) => {
   try {
     const {
       gymId,
@@ -1409,6 +1103,12 @@ app.get('/api/gym-members', async (req, res) => {
     } = req.query;
 
     if (!gymId) return res.status(400).json({ message: 'gymId is required' });
+
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      if (!staffRow) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const pageNum  = Math.max(1, parseInt(page,  10) || 1);
     const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
@@ -1521,9 +1221,13 @@ app.get('/api/gym-members', async (req, res) => {
 
 // ── GET /api/gym-members/count/:gymId ────────────────────────────────────────
 
-app.get('/api/gym-members/count/:gymId', async (req, res) => {
+app.get('/api/gym-members/count/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner && !(await getActiveGymStaffRow(req.user.id, gymId))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const nowStr    = new Date().toISOString().slice(0, 10);
     const in7Days   = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
@@ -1587,19 +1291,39 @@ app.get('/api/gym-members/count/:gymId', async (req, res) => {
 
 // ── Member detail helper ──────────────────────────────────────────────────────
 
+const MEMBER_DETAIL_SELECT = `
+  id, gym_id, membership_type, start_date, end_date, status,
+  users!gym_memberships_user_id_fkey!inner(
+    id, full_name, phone, age, height, current_weight, gender, created_at
+  )
+`;
+
 async function buildMemberDetail(memberId) {
-  // 1. Most-recent membership + user data (one query, take first row)
-  const { data: memberships, error: memErr } = await supabase
+  // Prefer the currently active membership row; a member can accumulate
+  // historical (inactive/removed) rows from past unlink+relink cycles, and
+  // those must not shadow the active one just for being more recent.
+  const { data: activeRows, error: activeErr } = await supabase
     .from('gym_memberships')
-    .select(`
-      id, gym_id, membership_type, start_date, end_date, status,
-      users!gym_memberships_user_id_fkey!inner(
-        id, full_name, phone, age, height, current_weight, gender, created_at
-      )
-    `)
+    .select(MEMBER_DETAIL_SELECT)
     .eq('user_id', memberId)
-    .order('created_at', { ascending: false });
-  if (memErr) throw memErr;
+    .eq('status', 'active')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (activeErr) throw activeErr;
+
+  let memberships = activeRows;
+  if (!memberships || memberships.length === 0) {
+    // No active row (e.g. viewing an inactive/former member's history) —
+    // fall back to the most recent row of any status.
+    const { data: anyRows, error: anyErr } = await supabase
+      .from('gym_memberships')
+      .select(MEMBER_DETAIL_SELECT)
+      .eq('user_id', memberId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (anyErr) throw anyErr;
+    memberships = anyRows;
+  }
   if (!memberships || memberships.length === 0) return null;
 
   const membership = memberships[0];
@@ -1692,11 +1416,15 @@ async function buildMemberDetail(memberId) {
 
 // ── GET /api/gym-members/:memberId ────────────────────────────────────────────
 
-app.get('/api/gym-members/:memberId', async (req, res) => {
+app.get('/api/gym-members/:memberId', auth, async (req, res) => {
   try {
     const { memberId } = req.params;
     const detail = await buildMemberDetail(memberId);
     if (!detail) return res.status(404).json({ error: 'Member not found' });
+    const isOwner = await isGymOwner(req.user.id, detail._gymId);
+    if (!isOwner && !(await getActiveGymStaffRow(req.user.id, detail._gymId))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const { _gymId, ...member } = detail;   // strip internal field
     res.json(member);
   } catch (err) {
@@ -1707,7 +1435,7 @@ app.get('/api/gym-members/:memberId', async (req, res) => {
 
 // ── POST /api/gym-members/:memberId/renew ─────────────────────────────────────
 
-app.post('/api/gym-members/:memberId/renew', async (req, res) => {
+app.post('/api/gym-members/:memberId/renew', auth, async (req, res) => {
   try {
     const { memberId } = req.params;
     const { plan_type, amount, new_end_date } = req.body || {};
@@ -1730,6 +1458,9 @@ app.post('/api/gym-members/:memberId/renew', async (req, res) => {
     if (!memRow) return res.status(404).json({ error: 'Member not found' });
 
     const gymId = memRow.gym_id;
+    if (!(await isGymOwner(req.user.id, gymId))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
 
     // Derive DB membership_type from plan_type label (or keep existing)
     const labelToType = Object.fromEntries(
@@ -1737,7 +1468,9 @@ app.post('/api/gym-members/:memberId/renew', async (req, res) => {
     );
     const newMembershipType = labelToType[(plan_type || '').toLowerCase()] || memRow.membership_type;
 
-    // 1. Update membership
+    // 1. Update membership — scoped to the specific resolved row, not every
+    // gym_memberships row this user has (a member can have historical rows
+    // from other gyms after an unlink+relink cycle).
     const { error: updErr } = await supabase
       .from('gym_memberships')
       .update({
@@ -1745,7 +1478,7 @@ app.post('/api/gym-members/:memberId/renew', async (req, res) => {
         status:          'active',
         membership_type: newMembershipType,
       })
-      .eq('user_id', memberId);
+      .eq('id', memRow.id);
     if (updErr) throw updErr;
 
     // 2. Insert paid payment record
@@ -1777,16 +1510,33 @@ app.post('/api/gym-members/:memberId/renew', async (req, res) => {
 
 // ── DELETE /api/gym-members/:memberId ─────────────────────────────────────────
 
-app.delete('/api/gym-members/:memberId', async (req, res) => {
+app.delete('/api/gym-members/:memberId', auth, async (req, res) => {
   try {
     // memberId is the users.id (the list returns user id as member id)
     const { memberId } = req.params;
 
-    // 1. Soft-delete all memberships for this user
+    // Resolve gym_id from the member's active membership to check ownership.
+    const { data: memRow, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('gym_id')
+      .eq('user_id', memberId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+    if (!memRow) return res.status(404).json({ error: 'Member not found' });
+    if (!(await isGymOwner(req.user.id, memRow.gym_id))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // 1. Soft-delete this user's ACTIVE membership(s) only — an already
+    // -inactive row from a prior unlink at a different gym must be left alone.
     const { error: memErr } = await supabase
       .from('gym_memberships')
       .update({ status: 'inactive' })
-      .eq('user_id', memberId);
+      .eq('user_id', memberId)
+      .eq('status', 'active');
     if (memErr) throw memErr;
 
     // 2. Detach user from gym, reset role
@@ -1805,11 +1555,14 @@ app.delete('/api/gym-members/:memberId', async (req, res) => {
 
 // ── Trainer management ────────────────────────────────────────────────────────
 
-app.post('/api/gym-trainers/invite', async (req, res) => {
+app.post('/api/gym-trainers/invite', auth, async (req, res) => {
   try {
     const { gym_id, type, value } = req.body || {};
 
     if (!gym_id)  return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     if (!type || !['phone', 'email'].includes(type))
       return res.status(400).json({ message: 'type must be "phone" or "email"' });
     if (!value || !value.trim())
@@ -1873,11 +1626,14 @@ app.post('/api/gym-trainers/invite', async (req, res) => {
   }
 });
 
-app.post('/api/gym-trainers/manual', async (req, res) => {
+app.post('/api/gym-trainers/manual', auth, async (req, res) => {
   try {
     const { gym_id, full_name, phone, specializations, experience_years } = req.body;
     if (!gym_id || !full_name) {
       return res.status(400).json({ message: 'gym_id and full_name are required' });
+    }
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     const invite_code = Math.random().toString(36).substring(2, 10).toUpperCase();
@@ -1913,7 +1669,7 @@ app.post('/api/gym-trainers/manual', async (req, res) => {
   }
 });
 
-app.get('/api/gym-trainers/:gymId', async (req, res) => {
+app.get('/api/gym-trainers/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
 
@@ -1921,6 +1677,11 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
     const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
     if (!uuidRegex.test(gymId)) {
       return res.json([]);
+    }
+
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner && !(await getActiveGymStaffRow(req.user.id, gymId))) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     // Step 1: get active trainer_profiles for this gym
@@ -1993,19 +1754,22 @@ app.get('/api/gym-trainers/:gymId', async (req, res) => {
   }
 });
 
-app.delete('/api/gym-trainers/:trainerId', async (req, res) => {
+app.delete('/api/gym-trainers/:trainerId', auth, async (req, res) => {
   try {
     const { trainerId } = req.params;
 
     // Verify the trainer exists and is currently active
     const { data: existing, error: fetchErr } = await supabase
       .from('trainer_profiles')
-      .select('id, is_active')
+      .select('id, is_active, gym_id')
       .eq('id', trainerId)
       .maybeSingle();
     if (fetchErr) throw fetchErr;
     if (!existing)           return res.status(404).json({ message: 'Trainer not found' });
     if (!existing.is_active) return res.status(404).json({ message: 'Trainer already inactive' });
+    if (!(await isGymOwner(req.user.id, existing.gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const { error: profileErr } = await supabase
       .from('trainer_profiles')
@@ -2023,15 +1787,33 @@ app.delete('/api/gym-trainers/:trainerId', async (req, res) => {
   }
 });
 
-app.post('/api/gym-members/:memberId/assign-trainer', async (req, res) => {
+app.post('/api/gym-members/:memberId/assign-trainer', auth, async (req, res) => {
   try {
     const { memberId } = req.params;
     const { trainer_id } = req.body;
 
+    // Resolve gym_id from the member's active membership to check ownership.
+    const { data: memRow, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('gym_id')
+      .eq('user_id', memberId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+    if (!memRow) return res.status(404).json({ message: 'Member not found' });
+    if (!(await isGymOwner(req.user.id, memRow.gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // Scope to the active membership row only, not every historical row
+    // this user has (e.g. from a prior gym they've since unlinked from).
     const { error } = await supabase
       .from('gym_memberships')
       .update({ assigned_trainer_id: trainer_id || null })
-      .eq('user_id', memberId);
+      .eq('user_id', memberId)
+      .eq('status', 'active');
     if (error) throw error;
 
     res.json({ success: true });
@@ -2044,10 +1826,16 @@ app.post('/api/gym-members/:memberId/assign-trainer', async (req, res) => {
 // ── GET /api/gym/revenue  ─────────────────────────────────────────────────────
 // Returns SUM of payments.amount for status='paid' in the current calendar month.
 
-app.get('/api/gym/revenue', async (req, res) => {
+app.get('/api/gym/revenue', auth, async (req, res) => {
   try {
     const gymId = req.query.gym_id;
     if (!gymId) return res.status(400).json({ message: 'gym_id is required' });
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasPaymentAccess = staffRow && await staffHasPaymentAccess(staffRow.id);
+      if (!hasPaymentAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const now            = new Date();
     const monthStart     = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
@@ -2104,9 +1892,15 @@ function paymentPeriodRange(period) {
 
 // ── GET /api/gym-payments/:gymId/summary (before /:gymId to avoid param capture)
 
-app.get('/api/gym-payments/:gymId/summary', async (req, res) => {
+app.get('/api/gym-payments/:gymId/summary', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasPaymentAccess = staffRow && await staffHasPaymentAccess(staffRow.id);
+      if (!hasPaymentAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
     const now             = new Date();
     const thisMonthStart  = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
     const lastMonthStart  = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString();
@@ -2181,10 +1975,17 @@ app.get('/api/gym-payments/:gymId/summary', async (req, res) => {
 
 // ── GET /api/gym-payments/:gymId
 
-app.get('/api/gym-payments/:gymId', async (req, res) => {
+app.get('/api/gym-payments/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { status, period, page = '1', limit = '20' } = req.query;
+
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasPaymentAccess = staffRow && await staffHasPaymentAccess(staffRow.id);
+      if (!hasPaymentAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const pageNum  = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
@@ -2249,10 +2050,25 @@ app.get('/api/gym-payments/:gymId', async (req, res) => {
 
 // ── POST /api/gym-payments/:paymentId/mark-paid
 
-app.post('/api/gym-payments/:paymentId/mark-paid', async (req, res) => {
+app.post('/api/gym-payments/:paymentId/mark-paid', auth, async (req, res) => {
   try {
     const { paymentId } = req.params;
     const { payment_method, notes } = req.body || {};
+
+    const { data: paymentRow, error: payLookupErr } = await supabase
+      .from('payments')
+      .select('gym_id')
+      .eq('id', paymentId)
+      .maybeSingle();
+    if (payLookupErr) throw payLookupErr;
+    if (!paymentRow) return res.status(404).json({ message: 'Payment not found' });
+
+    const isOwner = await isGymOwner(req.user.id, paymentRow.gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, paymentRow.gym_id);
+      const hasPaymentAccess = staffRow && await staffHasPaymentAccess(staffRow.id);
+      if (!hasPaymentAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const update = { status: 'paid', paid_at: new Date().toISOString() };
     if (payment_method) update.payment_method = String(payment_method).trim();
@@ -2270,10 +2086,13 @@ app.post('/api/gym-payments/:paymentId/mark-paid', async (req, res) => {
 
 // ── POST /api/gym-payments/send-reminders (stub — SMS not wired yet)
 
-app.post('/api/gym-payments/send-reminders', async (req, res) => {
+app.post('/api/gym-payments/send-reminders', auth, async (req, res) => {
   try {
     const { gym_id } = req.body || {};
     if (!gym_id) return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const { data: overdueRows, error } = await supabase
       .from('payments')
@@ -2303,7 +2122,7 @@ app.post('/api/gym-payments/send-reminders', async (req, res) => {
 
 // ── POST /api/gym-payments
 
-app.post('/api/gym-payments', async (req, res) => {
+app.post('/api/gym-payments', auth, async (req, res) => {
   try {
     // Accept both new shape (member_id, plan_type) and legacy shape (user_id, due_date)
     const {
@@ -2320,6 +2139,13 @@ app.post('/api/gym-payments', async (req, res) => {
     const resolvedUserId = member_id || user_id;
     if (!gym_id)          return res.status(400).json({ message: 'gym_id is required' });
     if (!resolvedUserId)  return res.status(400).json({ message: 'member_id (or user_id) is required' });
+
+    const isOwner = await isGymOwner(req.user.id, gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gym_id);
+      const hasPaymentAccess = staffRow && await staffHasPaymentAccess(staffRow.id);
+      if (!hasPaymentAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt <= 0) {
@@ -2406,10 +2232,33 @@ function getMondayOf(d) {
   return m;
 }
 
-app.get('/api/gym-schedule/:gymId', async (req, res) => {
+// Add `days` to a YYYY-MM-DD string using UTC arithmetic only, so the result
+// doesn't shift with the server process's local timezone (new Date(dateStr)
+// without a 'Z' parses as local time, which corrupts the day boundary on any
+// non-UTC host — see gym-schedule date-range bug).
+function addDaysToDateStr(dateStr, days) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+app.get('/api/gym-schedule/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { date, week_start } = req.query;
+
+    // Readable by the gym owner, staff with schedule access, or any active
+    // member of this gym (member class-booking screens hit this same route).
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasStaffAccess = staffRow && await staffHasPermission(staffRow.id, ['view_schedule']);
+      if (!hasStaffAccess) {
+        const isMember = await isActiveGymMember(req.user.id, gymId);
+        if (!isMember) return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
 
     // ── Build date range ──────────────────────────────────────────────────────
     let rangeStart, rangeEnd, isSingleDay;
@@ -2417,15 +2266,11 @@ app.get('/api/gym-schedule/:gymId', async (req, res) => {
     if (date) {
       isSingleDay = true;
       rangeStart  = date + 'T00:00:00';
-      const next  = new Date(date + 'T00:00:00');
-      next.setDate(next.getDate() + 1);
-      rangeEnd    = next.toISOString().slice(0, 10) + 'T00:00:00';
+      rangeEnd    = addDaysToDateStr(date, 1) + 'T00:00:00';
     } else if (week_start) {
       isSingleDay = false;
       rangeStart  = week_start + 'T00:00:00';
-      const end   = new Date(week_start + 'T00:00:00');
-      end.setDate(end.getDate() + 7);
-      rangeEnd    = end.toISOString().slice(0, 10) + 'T00:00:00';
+      rangeEnd    = addDaysToDateStr(week_start, 7) + 'T00:00:00';
     } else {
       // Backward-compat: no params → return all active classes (old behaviour)
       const { data: allClasses, error: allErr } = await supabase
@@ -2533,15 +2378,14 @@ app.get('/api/gym-schedule/:gymId', async (req, res) => {
       const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
       const days = [];
       for (let i = 0; i < 7; i++) {
-        const d       = new Date(week_start + 'T00:00:00');
-        d.setDate(d.getDate() + i);
-        const dateStr = d.toISOString().slice(0, 10);
+        const dateStr = addDaysToDateStr(week_start, i);
+        const dayOfWeek = new Date(dateStr + 'T00:00:00Z').getUTCDay();
         const dayClasses = classList
           .filter(c => (c.start_time || '').slice(0, 10) === dateStr)
           .map(shapeClass);
         days.push({
           date:        dateStr,
-          day_label:   DAY_LABELS[d.getDay()],
+          day_label:   DAY_LABELS[dayOfWeek],
           has_classes: dayClasses.length > 0,
           class_count: dayClasses.length,
           classes:     dayClasses,
@@ -2555,7 +2399,7 @@ app.get('/api/gym-schedule/:gymId', async (req, res) => {
   }
 });
 
-app.post('/api/gym-schedule', async (req, res) => {
+app.post('/api/gym-schedule', auth, async (req, res) => {
   try {
     const {
       gym_id, class_name, trainer_id,
@@ -2565,6 +2409,12 @@ app.post('/api/gym-schedule', async (req, res) => {
     } = req.body || {};
 
     if (!gym_id)             return res.status(400).json({ message: 'gym_id is required' });
+
+    // No staff "manage_schedule" permission exists (only the read-only
+    // "view_schedule" key) — class creation is owner-only.
+    const isOwner = await isGymOwner(req.user.id, gym_id);
+    if (!isOwner) return res.status(403).json({ message: 'Forbidden' });
+
     if (!class_name?.trim()) return res.status(400).json({ message: 'class_name is required' });
     if (!start_time)         return res.status(400).json({ message: 'start_time is required' });
 
@@ -2632,26 +2482,33 @@ app.post('/api/gym-schedule', async (req, res) => {
   }
 });
 
-app.delete('/api/gym-schedule/:classId', async (req, res) => {
+app.delete('/api/gym-schedule/:classId', auth, async (req, res) => {
   try {
     const { classId }  = req.params;
     const isRecurring  = req.query.recurring === 'true';
 
-    if (isRecurring) {
-      // 1. Fetch the target class to get class_name + trainer_id
-      const { data: cls, error: fetchErr } = await supabase
-        .from('class_schedule')
-        .select('class_name, trainer_id')
-        .eq('id', classId)
-        .maybeSingle();
-      if (fetchErr) throw fetchErr;
-      if (!cls) return res.status(404).json({ message: 'Class not found' });
+    // Class creation has no staff "manage_schedule" permission — deletion is
+    // owner-only too. classId alone doesn't carry gym_id, so look the class
+    // up first to find which gym it belongs to.
+    const { data: cls, error: fetchErr } = await supabase
+      .from('class_schedule')
+      .select('gym_id, class_name, trainer_id')
+      .eq('id', classId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!cls) return res.status(404).json({ message: 'Class not found' });
 
-      // 2. Delete this class + all future classes with same name & trainer
+    const isOwner = await isGymOwner(req.user.id, cls.gym_id);
+    if (!isOwner) return res.status(403).json({ message: 'Forbidden' });
+
+    if (isRecurring) {
+      // Delete this class + all future classes with same name & trainer,
+      // scoped to the same gym.
       const nowIso = new Date().toISOString();
       let q = supabase
         .from('class_schedule')
         .delete()
+        .eq('gym_id', cls.gym_id)
         .eq('class_name', cls.class_name)
         .gte('start_time', nowIso);
       if (cls.trainer_id) q = q.eq('trainer_id', cls.trainer_id);
@@ -2680,9 +2537,20 @@ app.delete('/api/gym-schedule/:classId', async (req, res) => {
 
 const VALID_PRIORITIES = ['normal', 'important', 'urgent'];
 
-app.get('/api/gym-announcements/:gymId', async (req, res) => {
+app.get('/api/gym-announcements/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
+
+    // Owner-side and staff (view_announcements) management screens hit this
+    // directly. Regular members read announcements via the embedded feed on
+    // GET /api/my-gym/:userId instead, so no member branch here.
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasAccess = staffRow && await staffHasPermission(staffRow.id, ['view_announcements']);
+      if (!hasAccess) return res.status(403).json({ error: 'Forbidden' });
+    }
+
     const { data, error } = await supabase
       .from('announcements')
       .select('id, title, body, priority, created_at')
@@ -2697,14 +2565,23 @@ app.get('/api/gym-announcements/:gymId', async (req, res) => {
   }
 });
 
-app.post('/api/gym-announcements', async (req, res) => {
+app.post('/api/gym-announcements', auth, async (req, res) => {
   try {
-    const { gym_id, posted_by, title, body, priority } = req.body || {};
+    const { gym_id, title, body, priority } = req.body || {};
 
     if (!gym_id)                    return res.status(400).json({ message: 'gym_id is required' });
-    if (!posted_by)                 return res.status(400).json({ message: 'posted_by is required' });
     if (!title || !title.trim())    return res.status(400).json({ message: 'title is required' });
     if (!body || !body.trim())      return res.status(400).json({ message: 'body is required' });
+
+    // No staff "manage_announcements" key exists — posting is gated on the
+    // same "view_announcements" permission the Staff Announcements screen
+    // itself checks before showing the Post button.
+    const isOwner = await isGymOwner(req.user.id, gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gym_id);
+      const hasAccess = staffRow && await staffHasPermission(staffRow.id, ['view_announcements']);
+      if (!hasAccess) return res.status(403).json({ message: 'Forbidden' });
+    }
 
     const pri = priority || 'normal';
     if (!VALID_PRIORITIES.includes(pri)) {
@@ -2715,7 +2592,7 @@ app.post('/api/gym-announcements', async (req, res) => {
       .from('announcements')
       .insert({
         gym_id,
-        posted_by,
+        posted_by: req.user.id, // never trust a client-supplied poster identity
         title: title.trim(),
         body: body.trim(),
         priority: pri,
@@ -2732,9 +2609,30 @@ app.post('/api/gym-announcements', async (req, res) => {
   }
 });
 
-app.delete('/api/gym-announcements/:announcementId', async (req, res) => {
+app.delete('/api/gym-announcements/:announcementId', auth, async (req, res) => {
   try {
     const { announcementId } = req.params;
+
+    // announcementId alone doesn't carry gym_id — look the row up first.
+    const { data: ann, error: fetchErr } = await supabase
+      .from('announcements')
+      .select('gym_id, posted_by')
+      .eq('id', announcementId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!ann) return res.status(404).json({ error: 'Announcement not found' });
+
+    const isOwner = await isGymOwner(req.user.id, ann.gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, ann.gym_id);
+      const hasAccess = staffRow && await staffHasPermission(staffRow.id, ['view_announcements']);
+      // Staff (matching the "isOwn" delete button in the Staff Announcements
+      // UI) may only remove their own posts — owner can remove any.
+      if (!hasAccess || ann.posted_by !== req.user.id) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
     const { error } = await supabase
       .from('announcements')
       .update({ is_active: false })
@@ -2749,9 +2647,10 @@ app.delete('/api/gym-announcements/:announcementId', async (req, res) => {
 
 // ── Consumer-side: My Gym ─────────────────────────────────────────────────────
 
-app.get('/api/my-gym/:userId', async (req, res) => {
+app.get('/api/my-gym/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (userId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     // gym_memberships is the source of truth for gym linkage. users.gym_id is a
     // denormalized convenience field that can go stale (e.g. a join that failed
@@ -2772,10 +2671,10 @@ app.get('/api/my-gym/:userId', async (req, res) => {
 
     const gymId = membershipRow.gym_id;
 
-    const [gymRes, announcementsRes, scheduleRes] = await Promise.all([
+    const [gymRes, announcementsRes, feedAnnouncementsRes, scheduleRes] = await Promise.all([
       supabase
         .from('gyms')
-        .select('name, address, phone, logo_url')
+        .select('id, name, address, phone, logo_url')
         .eq('id', gymId)
         .maybeSingle(),
       supabase
@@ -2784,7 +2683,18 @@ app.get('/api/my-gym/:userId', async (req, res) => {
         .eq('gym_id', gymId)
         .eq('is_active', true)
         .order('created_at', { ascending: false })
-        .limit(10),
+        .limit(3),
+      // Gym owners currently have no UI wired to the dedicated `announcements`
+      // table — they post "Announcement"-type items via the Gym Feed composer,
+      // which lands in gym_feed_posts. Merge both sources so those actually
+      // show up here instead of only in the feed.
+      supabase
+        .from('gym_feed_posts')
+        .select('id, title, content, created_at, users!gym_feed_posts_author_id_fkey(full_name)')
+        .eq('gym_id', gymId)
+        .eq('post_type', 'announcement')
+        .order('created_at', { ascending: false })
+        .limit(3),
       supabase
         .from('class_schedule')
         .select('id, class_name, description, trainer_id, day_of_week, start_time, end_time, capacity')
@@ -2794,9 +2704,31 @@ app.get('/api/my-gym/:userId', async (req, res) => {
         .order('start_time', { ascending: true }),
     ]);
 
-    if (gymRes.error)           throw gymRes.error;
-    if (announcementsRes.error) throw announcementsRes.error;
-    if (scheduleRes.error)      throw scheduleRes.error;
+    if (gymRes.error)             throw gymRes.error;
+    if (announcementsRes.error)   throw announcementsRes.error;
+    if (feedAnnouncementsRes.error) throw feedAnnouncementsRes.error;
+    if (scheduleRes.error)        throw scheduleRes.error;
+
+    const mergedAnnouncements = [
+      ...(announcementsRes.data || []).map(a => ({
+        id: a.id,
+        title: a.title,
+        body: a.body,
+        priority: a.priority,
+        created_at: a.created_at,
+        posted_by: null,
+      })),
+      ...(feedAnnouncementsRes.data || []).map(p => ({
+        id: p.id,
+        title: p.title,
+        body: p.content,
+        priority: null,
+        created_at: p.created_at,
+        posted_by: p.users?.full_name || null,
+      })),
+    ]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 3);
 
     const schedule = scheduleRes.data || [];
     const trainerIds = [...new Set(schedule.map(s => s.trainer_id).filter(Boolean))];
@@ -2818,7 +2750,7 @@ app.get('/api/my-gym/:userId', async (req, res) => {
         start_date: membershipRow.start_date || null,
         end_date: membershipRow.end_date || null,
       },
-      announcements: announcementsRes.data || [],
+      announcements: mergedAnnouncements,
       schedule: schedule.map(s => ({ ...s, trainer_name: nameById.get(s.trainer_id) || null })),
     });
   } catch (err) {
@@ -2827,11 +2759,57 @@ app.get('/api/my-gym/:userId', async (req, res) => {
   }
 });
 
-app.post('/api/gym-join', async (req, res) => {
+// PATCH /api/my-gym/unlink — member leaves their current gym (soft delete).
+// Self-only: acts on the authenticated user's own membership, never a
+// param/body-supplied id. History (workout/food logs, progress, assigned
+// plans) is untouched — only gym_memberships.status flips to 'inactive'.
+app.patch('/api/my-gym/unlink', auth, async (req, res) => {
   try {
-    const { user_id, join_code } = req.body || {};
+    const userId = req.user.id;
 
-    if (!user_id)  return res.status(400).json({ message: 'user_id is required' });
+    const { data: membershipRow, error: memErr } = await supabase
+      .from('gym_memberships')
+      .select('id, gym_id')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (memErr) throw memErr;
+    if (!membershipRow) return res.status(404).json({ error: 'No active gym membership found' });
+
+    const { error: updErr } = await supabase
+      .from('gym_memberships')
+      .update({ status: 'inactive', updated_at: new Date().toISOString() })
+      .eq('id', membershipRow.id)
+      .eq('user_id', userId);
+    if (updErr) throw updErr;
+
+    // users.gym_id is a denormalized convenience pointer several read paths
+    // (e.g. supplementRoutes' memberOnly fallback, ConsumerLayout's hasGym
+    // flag) trust directly — clear it so it can't keep granting access to a
+    // gym this member just left.
+    const { error: userErr } = await supabase
+      .from('users')
+      .update({ gym_id: null, role: 'consumer' })
+      .eq('id', userId);
+    if (userErr) throw userErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/my-gym/unlink error:', err);
+    res.status(500).json({ error: err.message || 'Failed to unlink gym' });
+  }
+});
+
+app.post('/api/gym-join', auth, async (req, res) => {
+  try {
+    const { join_code } = req.body || {};
+    // Never trust a client-supplied target user — otherwise any caller could
+    // silently enroll a DIFFERENT user into a gym via join_code. The joining
+    // user is always the authenticated caller.
+    const user_id = req.user.id;
+
     if (!join_code || !join_code.trim()) {
       return res.status(400).json({ message: 'join_code is required' });
     }
@@ -2861,9 +2839,11 @@ app.post('/api/gym-join', async (req, res) => {
     // the user isn't actually a member of.
     const { data: existingMembership, error: memLookupErr } = await supabase
       .from('gym_memberships')
-      .select('id')
+      .select('id, status')
       .eq('gym_id', gym.id)
       .eq('user_id', user_id)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
     if (memLookupErr) throw memLookupErr;
 
@@ -2878,6 +2858,23 @@ app.post('/api/gym-join', async (req, res) => {
           metadata: { source: 'join_code' },
         });
       if (memErr) throw memErr;
+    } else if (existingMembership.status !== 'active') {
+      // Row exists but is inactive (e.g. this member unlinked before) —
+      // reactivate it instead of silently no-op'ing, so re-joining the same
+      // gym after unlinking actually works. end_date is NOT NULL, so mirror
+      // the same 30-day default a fresh join_code insert gets.
+      const freshStart = new Date().toISOString().slice(0, 10);
+      const freshEnd = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+      const { error: reactivateErr } = await supabase
+        .from('gym_memberships')
+        .update({
+          status: 'active',
+          start_date: freshStart,
+          end_date: freshEnd,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', existingMembership.id);
+      if (reactivateErr) throw reactivateErr;
     }
 
     const update = { gym_id: gym.id };
@@ -2898,12 +2895,14 @@ app.post('/api/gym-join', async (req, res) => {
 
 // ── QR check-in ──────────────────────────────────────────────────────────────
 
-app.get('/api/gym-qr/:gymId', async (req, res) => {
+app.get('/api/gym-qr/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { user_id } = req.query;
 
     if (!user_id) return res.status(400).json({ error: 'user_id query param is required' });
+    // Self-only: a member fetches their own check-in QR (only caller today).
+    if (user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     // Verify active membership
     const { data: membership, error: memErr } = await supabase
@@ -2935,13 +2934,33 @@ app.get('/api/gym-qr/:gymId', async (req, res) => {
   }
 });
 
-function todayMidnightIso() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.toISOString();
+// Gyms operate in India; "today"/date-range boundaries must be computed
+// against IST (UTC+5:30), not the server process's own timezone (Railway
+// runs UTC) or a naive UTC calendar day — otherwise a check-in shortly after
+// local midnight lands in the wrong day's bucket.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+// Today's calendar date in IST as YYYY-MM-DD, independent of server TZ.
+function istTodayYMD() {
+  return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
-app.post('/api/checkin', async (req, res) => {
+// UTC instant corresponding to 00:00:00.000 IST of the given YYYY-MM-DD
+// (interpreted as an IST calendar date), or of "today" in IST if omitted.
+function istDateStartIso(dateStr) {
+  return new Date(`${dateStr || istTodayYMD()}T00:00:00.000+05:30`).toISOString();
+}
+
+// UTC instant corresponding to 23:59:59.999 IST of the given YYYY-MM-DD.
+function istDateEndIso(dateStr) {
+  return new Date(`${dateStr || istTodayYMD()}T23:59:59.999+05:30`).toISOString();
+}
+
+function todayMidnightIso() {
+  return istDateStartIso();
+}
+
+app.post('/api/checkin', auth, async (req, res) => {
   try {
     let { gym_id, user_id, member_id, method, qr_payload } = req.body;
 
@@ -2960,6 +2979,15 @@ app.post('/api/checkin', async (req, res) => {
 
     if (!gym_id) {
       return res.status(400).json({ error: 'gym_id is required' });
+    }
+
+    // Front-desk action performed BY the gym owner or an active staff member
+    // WITH checkin permission — never a member self-checkin (no such flow exists).
+    const isOwner = await isGymOwner(req.user.id, gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gym_id);
+      const hasCheckinAccess = staffRow && await staffHasPermission(staffRow.id, ['checkin']);
+      if (!hasCheckinAccess) return res.status(403).json({ error: 'Forbidden' });
     }
 
     let resolvedMemberId = member_id;
@@ -3037,11 +3065,22 @@ app.post('/api/checkin', async (req, res) => {
   }
 });
 
-app.post('/api/checkout', async (req, res) => {
+app.post('/api/checkout', auth, async (req, res) => {
   try {
     const { gym_id, checkin_id } = req.body;
     if (!gym_id || !checkin_id) {
       return res.status(400).json({ error: 'gym_id and checkin_id are required' });
+    }
+
+    // Front-desk action performed BY the gym owner or an active staff member
+    // WITH checkin permission — mirrors POST /api/checkin, whose payload
+    // shape (gym_id + checkin_id only) has no member identity to self-scope
+    // against, so this can never be a member self-checkout.
+    const isOwner = await isGymOwner(req.user.id, gym_id);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gym_id);
+      const hasCheckinAccess = staffRow && await staffHasPermission(staffRow.id, ['checkin']);
+      if (!hasCheckinAccess) return res.status(403).json({ error: 'Forbidden' });
     }
 
     const { data: checkin, error: checkinErr } = await supabase
@@ -3073,9 +3112,21 @@ app.post('/api/checkout', async (req, res) => {
   }
 });
 
-app.get('/api/gym-occupancy/:gymId', async (req, res) => {
+app.get('/api/gym-occupancy/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
+
+    // Read by owner/staff front-desk screens AND member-facing screens
+    // (My Gym, Home) showing "how busy is my gym right now".
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasStaffAccess = staffRow && await staffHasPermission(staffRow.id, ['checkin']);
+      if (!hasStaffAccess) {
+        const isMember = await isActiveGymMember(req.user.id, gymId);
+        if (!isMember) return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
 
     // Members currently inside (not checked out, checked in today)
     const { data: insideData, error: insideErr } = await supabase
@@ -3135,20 +3186,25 @@ app.get('/api/gym-occupancy/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
+app.get('/api/gym-checkin-history/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { date, page = '1', limit = '20' } = req.query;
-    
-    // Parse date or default to today
-    let targetDate = new Date();
-    if (date) {
-      targetDate = new Date(date);
+
+    // Front-desk audit log — owner or staff with checkin access only, no
+    // frontend caller uses this from a plain member screen.
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasStaffAccess = staffRow && await staffHasPermission(staffRow.id, ['checkin']);
+      if (!hasStaffAccess) return res.status(403).json({ error: 'Forbidden' });
     }
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+
+    // date is a YYYY-MM-DD IST calendar date (from the History date strip).
+    // Build boundaries against IST, not server-local/UTC — a check-in shortly
+    // after local midnight must still land in the correct calendar day.
+    const startOfDayIso = istDateStartIso(date);
+    const endOfDayIso = istDateEndIso(date);
 
     const pageNum = Math.max(1, parseInt(page, 10));
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10)));
@@ -3159,8 +3215,8 @@ app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
       .from('check_ins')
       .select('id', { count: 'exact', head: true })
       .eq('gym_id', gymId)
-      .gte('checked_in_at', startOfDay.toISOString())
-      .lte('checked_in_at', endOfDay.toISOString());
+      .gte('checked_in_at', startOfDayIso)
+      .lte('checked_in_at', endOfDayIso);
     if (countErr) throw countErr;
 
     const { data: historyData, error: historyErr } = await supabase
@@ -3174,8 +3230,8 @@ app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
         )
       `)
       .eq('gym_id', gymId)
-      .gte('checked_in_at', startOfDay.toISOString())
-      .lte('checked_in_at', endOfDay.toISOString())
+      .gte('checked_in_at', startOfDayIso)
+      .lte('checked_in_at', endOfDayIso)
       .order('checked_in_at', { ascending: false })
       .range(offset, offset + limitNum - 1);
 
@@ -3196,7 +3252,7 @@ app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
     });
 
     res.json({
-      date: startOfDay.toISOString().slice(0, 10),
+      date: date || istTodayYMD(),
       total: count || 0,
       checkins,
       page: pageNum,
@@ -3208,10 +3264,23 @@ app.get('/api/gym-checkin-history/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/gym-members-search/:gymId', async (req, res) => {
+app.get('/api/gym-members-search/:gymId', auth, async (req, res) => {
   try {
     const { gymId } = req.params;
     const { q } = req.query;
+
+    // PII search (name/phone/email) — shared by three staff screens (Check-in,
+    // Lockers, Payments), each gated on its own permission, so any one of
+    // those grants search access here.
+    const isOwner = await isGymOwner(req.user.id, gymId);
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
+      const hasStaffAccess = staffRow && await staffHasPermission(
+        staffRow.id,
+        ['checkin', 'manage_lockers', 'view_payments', 'collect_payment']
+      );
+      if (!hasStaffAccess) return res.status(403).json({ error: 'Forbidden' });
+    }
 
     if (!q || q.length < 2) {
       return res.status(400).json({ error: 'Search term must be at least 2 characters' });
@@ -3231,19 +3300,37 @@ app.get('/api/gym-members-search/:gymId', async (req, res) => {
     }
 
     const userIds = mems.map(m => m.user_id).filter(Boolean);
-    
-    // Now search users in these userIds matching q
+
+    // Fetch all candidate users for this gym (bounded by membership size).
     const { data: users, error: userErr } = await supabase
       .from('users')
       .select('id, full_name, phone')
-      .in('id', userIds)
-      .or(`full_name.ilike.%${q}%,phone.ilike.%${q}%`)
-      .limit(10);
-    
+      .in('id', userIds);
     if (userErr) throw userErr;
 
-    const userMap = new Map((users || []).map(u => [u.id, u]));
-    
+    // Owners often search by the login email/username rather than the
+    // (sometimes mistyped) display name, and email isn't a public.users
+    // column — it lives in auth.users, which PostgREST doesn't expose.
+    // Pull it per-candidate and match in-memory alongside name/phone.
+    const emailByUserId = {};
+    await Promise.all(userIds.map(async id => {
+      try {
+        const { data } = await supabase.auth.admin.getUserById(id);
+        if (data?.user?.email) emailByUserId[id] = data.user.email;
+      } catch { /* non-critical */ }
+    }));
+
+    const needle = q.toLowerCase();
+    const userMap = new Map(
+      (users || [])
+        .filter(u =>
+          (u.full_name || '').toLowerCase().includes(needle) ||
+          (u.phone || '').toLowerCase().includes(needle) ||
+          (emailByUserId[u.id] || '').toLowerCase().includes(needle)
+        )
+        .map(u => [u.id, u])
+    );
+
     const results = [];
     for (const gm of mems) {
       if (userMap.has(gm.user_id)) {
@@ -3253,6 +3340,7 @@ app.get('/api/gym-members-search/:gymId', async (req, res) => {
           user_id: u.id,
           full_name: u.full_name,
           phone: u.phone,
+          email: emailByUserId[u.id] || null,
           membership_type: gm.membership_type,
           expiry_date: gm.end_date,
           status: gm.status
@@ -3293,7 +3381,7 @@ function daysBetween(later, earlier) {
   return Math.floor((later.getTime() - earlier.getTime()) / (24 * 60 * 60 * 1000));
 }
 
-app.post('/api/gym-churn/score/:gymId', async (req, res) => {
+app.post('/api/gym-churn/score/:gymId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
 
@@ -3446,7 +3534,7 @@ app.post('/api/gym-churn/score/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/gym-churn/:gymId', async (req, res) => {
+app.get('/api/gym-churn/:gymId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
 
@@ -3498,7 +3586,7 @@ app.get('/api/gym-churn/:gymId', async (req, res) => {
 
 // ── ML service integration ──────────────────────────────────────────────────
 
-app.get('/api/ml/status', async (req, res) => {
+app.get('/api/ml/status', auth, async (req, res) => {
   try {
     const info = await ml.modelInfo();
     res.json(info);
@@ -3508,7 +3596,7 @@ app.get('/api/ml/status', async (req, res) => {
   }
 });
 
-app.post('/api/ml/score/:gymId', async (req, res) => {
+app.post('/api/ml/score/:gymId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
     if (!gymId) return res.status(400).json({ message: 'gymId is required' });
@@ -3520,7 +3608,7 @@ app.post('/api/ml/score/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/gym-stats/:gymId', async (req, res) => {
+app.get('/api/gym-stats/:gymId', auth, requireGymOwner, async (req, res) => {
   try {
     const { gymId } = req.params;
 
@@ -3577,46 +3665,16 @@ app.get('/api/gym-stats/:gymId', async (req, res) => {
       top_trainers = trainersList.slice(0, 3);
     }
 
-    // Dummy Revenue (INR scale)
-    const revenue = {
-      this_month:    124500,
-      last_month:    111200,
-      growth_percent: 12,
-      monthly_chart: [
-        { month: 'Jan', amount:  98000 },
-        { month: 'Feb', amount: 105000 },
-        { month: 'Mar', amount: 111200 },
-        { month: 'Apr', amount: 118000 },
-        { month: 'May', amount: 111200 },
-        { month: 'Jun', amount: 124500 },
-      ],
-    };
-
-    // Dummy Occupancy
-    const occupancy = {
-      avg_daily: 47,
-      peak_hour: '6:00 PM',
-      peak_day:  'Monday',
-      weekly_chart: [
-        { day: 'Mon', count: 62 },
-        { day: 'Tue', count: 45 },
-        { day: 'Wed', count: 58 },
-        { day: 'Thu', count: 41 },
-        { day: 'Fri', count: 55 },
-        { day: 'Sat', count: 38 },
-        { day: 'Sun', count: 22 },
-      ],
-    };
+    // Revenue and occupancy now come from GET /api/gym/:gymId/insights
+    // (routes/gymRoutes.js) — real payments/check_ins data, not stubs.
 
     res.json({
-      revenue,
       members: {
         total: membersTotalRes.count || 0,
         active: membersActiveRes.count || 0,
         new_this_month: membersNewRes.count || 0,
         expiring_soon: membersExpiringRes.count || 0
       },
-      occupancy,
       trainers: {
         total: totalTrainers,
         top_trainers
@@ -3628,7 +3686,7 @@ app.get('/api/gym-stats/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/gym-activity-heatmap/:gymId', async (req, res) => {
+app.get('/api/gym-activity-heatmap/:gymId', auth, requireGymOwner, async (req, res) => {
   const { gymId } = req.params;
   
   const generateRealisticCount = (dayIndex, hour) => {
@@ -3698,7 +3756,7 @@ app.get('/api/gym-activity-heatmap/:gymId', async (req, res) => {
   }
 });
 
-app.get('/api/ml/scores/:gymId', async (req, res) => {
+app.get('/api/ml/scores/:gymId', auth, requireGymOwner, async (req, res) => {
   const { gymId } = req.params;
   
   const stubResponse = {
@@ -3959,9 +4017,14 @@ app.post('/api/macros/calculate', async (req, res) => {
 });
 
 // Route 2: GET /api/macros/:userId
-app.get('/api/macros/:userId', async (req, res) => {
+app.get('/api/macros/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (userId !== req.user.id) {
+      // Trainer dashboards read a linked client's macros for progress tracking.
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, userId);
+      if (!isTrainer) return res.status(403).json({ message: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('user_macros')
       .select('*')
@@ -3979,7 +4042,7 @@ app.get('/api/macros/:userId', async (req, res) => {
 
 
 // Route 3: POST /api/food-logs
-app.post('/api/food-logs', async (req, res) => {
+app.post('/api/food-logs', auth, async (req, res) => {
   try {
     const {
       userId, log_date, date, mealType, foodName, quantity, servingUnit,
@@ -3987,6 +4050,9 @@ app.post('/api/food-logs', async (req, res) => {
     } = req.body;
     if (!userId || !mealType || !foodName || calories == null) {
       return res.status(400).json({ message: 'userId, mealType, foodName, calories are required' });
+    }
+    if (userId !== req.user.id) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
     const { data, error } = await supabase
       .from('food_logs')
@@ -4057,9 +4123,14 @@ app.post('/api/food-logs', async (req, res) => {
 });
 
 // Route 4: GET /api/food-logs/:userId?date=YYYY-MM-DD
-app.get('/api/food-logs/:userId', async (req, res) => {
+app.get('/api/food-logs/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (userId !== req.user.id) {
+      // Trainer dashboards read a linked client's food log for progress tracking.
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, userId);
+      if (!isTrainer) return res.status(403).json({ message: 'Forbidden' });
+    }
     const date = req.query.date || new Date().toISOString().slice(0, 10);
     const { data, error } = await supabase
       .from('food_logs')
@@ -4093,9 +4164,19 @@ app.get('/api/food-logs/:userId', async (req, res) => {
 });
 
 // Route 5: DELETE /api/food-logs/:logId
-app.delete('/api/food-logs/:logId', async (req, res) => {
+app.delete('/api/food-logs/:logId', auth, async (req, res) => {
   try {
     const { logId } = req.params;
+
+    const { data: logRow, error: lookupErr } = await supabase
+      .from('food_logs')
+      .select('user_id')
+      .eq('id', logId)
+      .maybeSingle();
+    if (lookupErr) throw lookupErr;
+    if (!logRow) return res.status(404).json({ message: 'Food log not found' });
+    if (logRow.user_id !== req.user.id) return res.status(403).json({ message: 'Forbidden' });
+
     const { error } = await supabase.from('food_logs').delete().eq('id', logId);
     if (error) throw error;
     res.json({ success: true });
@@ -4108,20 +4189,18 @@ app.delete('/api/food-logs/:logId', async (req, res) => {
 // Replaced by foodSearchRoutes.js
 
 // Route 7: POST /api/food-logs/voice (legacy — new route is POST /api/ai/voice/diet)
-app.post('/api/food-logs/voice', async (req, res) => {
+app.post('/api/food-logs/voice', auth, async (req, res) => {
   try {
     if (process.env.AI_VOICE_DIET_ENABLED !== 'true') {
       return res.status(503).json({ error: 'FEATURE_DISABLED', message: 'This feature is currently unavailable.' });
     }
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Missing auth token' });
-    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || !authData?.user) return res.status(401).json({ error: 'Invalid auth token' });
 
     const { userId, transcript, mealType } = req.body;
     if (!userId || !transcript || !mealType) {
       return res.status(400).json({ message: 'userId, transcript, mealType are required' });
+    }
+    if (userId !== req.user.id) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     const systemPrompt = `You are a food nutrition parser for an Indian fitness app. The user will describe what they ate in English or Hinglish. Extract each food item with estimated quantity and nutritional info per serving. Return ONLY valid JSON array, no markdown, no explanation:
@@ -4185,11 +4264,14 @@ Be generous with common sense. If someone says 'lunch mein dal chawal khaya' ass
 });
 
 // Route 8: POST /api/food-logs/camera
-app.post('/api/food-logs/camera', async (req, res) => {
+app.post('/api/food-logs/camera', auth, async (req, res) => {
   try {
     const { userId, imageBase64, mealType } = req.body;
     if (!userId || !imageBase64 || !mealType) {
       return res.status(400).json({ message: 'userId, imageBase64, mealType are required' });
+    }
+    if (userId !== req.user.id) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     const prompt = `Look at this photo of food. Identify each food item visible. For each item, estimate the portion size and nutritional content. Focus on Indian food if applicable. Return ONLY valid JSON array:
@@ -4252,10 +4334,10 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
 });
 
 // Route 9: POST /api/diet-plan/generate
-app.post('/api/diet-plan/generate', async (req, res) => {
+app.post('/api/diet-plan/generate', auth, async (req, res) => {
   try {
-    const { userId, dietType = 'non_veg', cuisinePref = 'north_indian' } = req.body;
-    if (!userId) return res.status(400).json({ message: 'userId is required' });
+    const userId = req.user.id;
+    const { dietType = 'non_veg', cuisinePref = 'north_indian' } = req.body;
 
     const { data: existing } = await supabase
       .from('user_macros')
@@ -4264,16 +4346,18 @@ app.post('/api/diet-plan/generate', async (req, res) => {
       .maybeSingle();
     const macros = existing || await computeMacrosForUser(userId);
 
-    const prompt = `Generate a 7-day Indian diet plan. Requirements:
+    const system = `You are a nutrition coach building a structured Indian diet plan for a fitness app. Output ONLY valid JSON, no prose, no markdown fences.`;
+
+    const user = `Generate a 7-day Indian diet plan. Requirements:
 - Daily target: ${macros.calories} calories, ${macros.protein_g}g protein, ${macros.carbs_g}g carbs, ${macros.fat_g}g fat
 - Diet type: ${dietType}
 - Cuisine: ${cuisinePref}
 - Budget-friendly, realistic Indian meals
-- Use familiar portions: roti count, katori for dal/sabzi, plate for rice, glass for milk/lassi
+- Use familiar Indian household portions for "quantity" on every item — roti/paratha count (e.g. "2 pieces"), katori for dal/sabzi/curd (e.g. "1 katori"), plate/bowl for rice or poha (e.g. "1 plate"), glass/cup for milk/lassi/chai (e.g. "1 glass"), tbsp for ghee/oil/chutney. Do NOT use generic units like "100g" or "1 serving" — always use the Indian household unit a home cook would actually use.
 - Include 4 meals per day: breakfast, lunch, snack, dinner
 - Each meal should list items with individual calories and macros
 
-Return ONLY valid JSON, no markdown:
+Return ONLY a JSON object with this exact structure — no markdown, no explanation:
 {
   "daily_targets": { "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number },
   "days": [
@@ -4294,16 +4378,21 @@ Return ONLY valid JSON, no markdown:
   ]
 }`;
 
-    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
-    const result = await model.generateContent(prompt);
-    const planData = extractJson(result.response.text());
+    const { callDeepSeek } = require('./src/ai/clients/deepseek');
+    const result = await callDeepSeek({ system, user, responseFormat: { type: 'json_object' } });
+    const planData = extractJson(result.text);
 
-    await supabase
-      .from('user_diet_plans')
-      .update({ is_active: false })
-      .eq('user_id', userId)
-      .eq('is_active', true);
+    // DeepSeek occasionally ignores the "7 days total" instruction and
+    // returns a partial plan (observed: 1 day). Reject rather than silently
+    // saving a plan that leaves 6 of 7 weekdays with no meals.
+    if (!Array.isArray(planData.days) || planData.days.length < 7) {
+      throw new Error(`AI returned an incomplete plan (${planData.days?.length || 0} of 7 days) — please try again.`);
+    }
 
+    // Insert the new plan BEFORE deactivating the old one — if generation or
+    // insert fails, the user must keep their existing active plan rather than
+    // being left with none (previously deactivated-then-inserted, so a failed
+    // insert silently zeroed out the user's plan).
     const { data, error } = await supabase
       .from('user_diet_plans')
       .insert({
@@ -4317,6 +4406,13 @@ Return ONLY valid JSON, no markdown:
       .single();
     if (error) throw error;
 
+    await supabase
+      .from('user_diet_plans')
+      .update({ is_active: false })
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .neq('id', data.id);
+
     res.json(data);
   } catch (err) {
     console.error('generate diet plan error:', err);
@@ -4325,9 +4421,12 @@ Return ONLY valid JSON, no markdown:
 });
 
 // Route 10: GET /api/diet-plan/:userId
-app.get('/api/diet-plan/:userId', async (req, res) => {
+app.get('/api/diet-plan/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (userId !== req.user.id) {
+      return res.status(403).json({ message: 'Not authorized to view this diet plan' });
+    }
     const { data, error } = await supabase
       .from('user_diet_plans')
       .select('*')
@@ -4347,12 +4446,13 @@ app.get('/api/diet-plan/:userId', async (req, res) => {
 // ── Custom Saved Meals ────────────────────────────────────────────────────────
 
 // POST /api/custom-meals
-app.post('/api/custom-meals', async (req, res) => {
+app.post('/api/custom-meals', auth, async (req, res) => {
   try {
     const { userId, name, items } = req.body;
     if (!userId || !name || !Array.isArray(items)) {
       return res.status(400).json({ error: 'userId, name, and items are required' });
     }
+    if (userId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
     const totals = items.reduce((acc, item) => ({
       calories: acc.calories + (Number(item.calories)  || 0),
       protein:  acc.protein  + (Number(item.protein_g) || 0),
@@ -4382,8 +4482,9 @@ app.post('/api/custom-meals', async (req, res) => {
 });
 
 // GET /api/custom-meals/:userId
-app.get('/api/custom-meals/:userId', async (req, res) => {
+app.get('/api/custom-meals/:userId', auth, async (req, res) => {
   try {
+    if (req.params.userId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
     const { data, error } = await supabase
       .from('custom_meals')
       .select('*')
@@ -4397,8 +4498,17 @@ app.get('/api/custom-meals/:userId', async (req, res) => {
 });
 
 // DELETE /api/custom-meals/:mealId
-app.delete('/api/custom-meals/:mealId', async (req, res) => {
+app.delete('/api/custom-meals/:mealId', auth, async (req, res) => {
   try {
+    const { data: mealRow, error: lookupErr } = await supabase
+      .from('custom_meals')
+      .select('user_id')
+      .eq('id', req.params.mealId)
+      .maybeSingle();
+    if (lookupErr) return res.status(500).json({ error: lookupErr.message });
+    if (!mealRow) return res.status(404).json({ error: 'Custom meal not found' });
+    if (mealRow.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+
     const { error } = await supabase
       .from('custom_meals')
       .delete()
@@ -4415,11 +4525,20 @@ app.delete('/api/custom-meals/:mealId', async (req, res) => {
 // POST /api/workout/finish
 // Uses service-role key → direct Postgres driver, bypasses PostgREST schema
 // cache entirely.  Fixes "exercises column not found" on workout_logs.
-app.post('/api/workout/finish', async (req, res) => {
+app.post('/api/workout/finish', auth, async (req, res) => {
   try {
     const { sessionId, durationMinutes, exercises, sets } = req.body;
 
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+    const { data: sessionRow, error: sessionLookupErr } = await supabase
+      .from('workout_logs')
+      .select('user_id')
+      .eq('id', sessionId)
+      .maybeSingle();
+    if (sessionLookupErr) throw sessionLookupErr;
+    if (!sessionRow) return res.status(404).json({ error: 'Workout session not found' });
+    if (sessionRow.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     const { data: updatedRow, error: updateError } = await supabase
       .from('workout_logs')
@@ -4473,6 +4592,7 @@ app.post('/api/workout/finish', async (req, res) => {
           .from('gym_memberships')
           .select('gym_id')
           .eq('user_id', updatedRow.user_id)
+          .eq('status', 'active')
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle()
@@ -4499,7 +4619,7 @@ app.post('/api/workout/finish', async (req, res) => {
 });
 
 // GET /api/workout/logs/:workoutId — fetch a single workout log by id (for summary page refresh)
-app.get('/api/workout/logs/:workoutId', async (req, res) => {
+app.get('/api/workout/logs/:workoutId', auth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('workout_logs')
@@ -4507,6 +4627,7 @@ app.get('/api/workout/logs/:workoutId', async (req, res) => {
       .eq('id', req.params.workoutId)
       .single();
     if (error) throw error;
+    if (data.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -4516,13 +4637,14 @@ app.get('/api/workout/logs/:workoutId', async (req, res) => {
 // ── Workout / set editing ─────────────────────────────────────────────────────
 
 // PUT /api/workout-sets/:setId — update weight_kg and reps_completed
-app.put('/api/workout-sets/:setId', async (req, res) => {
+app.put('/api/workout-sets/:setId', auth, async (req, res) => {
   try {
     const { setId } = req.params;
     const { weight_kg, reps, userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    // Ownership: set → workout_log → user
+    // Ownership: set → workout_log → user. Compared against the verified
+    // token identity (req.user.id), not the client-supplied userId field.
     const { data: setRow, error: setErr } = await supabase
       .from('workout_set_logs')
       .select('workout_log_id')
@@ -4536,7 +4658,7 @@ app.put('/api/workout-sets/:setId', async (req, res) => {
       .eq('id', setRow.workout_log_id)
       .maybeSingle();
     if (logErr || !logRow) return res.status(404).json({ error: 'Workout not found' });
-    if (logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+    if (logRow.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     const { error: updateErr } = await supabase
       .from('workout_set_logs')
@@ -4555,7 +4677,7 @@ app.put('/api/workout-sets/:setId', async (req, res) => {
 });
 
 // DELETE /api/workout-sets/:setId — delete a single set
-app.delete('/api/workout-sets/:setId', async (req, res) => {
+app.delete('/api/workout-sets/:setId', auth, async (req, res) => {
   try {
     const { setId } = req.params;
     const userId = req.body?.userId || req.query.userId;
@@ -4573,7 +4695,7 @@ app.delete('/api/workout-sets/:setId', async (req, res) => {
       .select('user_id')
       .eq('id', setRow.workout_log_id)
       .maybeSingle();
-    if (!logRow || logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+    if (!logRow || logRow.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     const { error } = await supabase
       .from('workout_set_logs')
@@ -4589,7 +4711,7 @@ app.delete('/api/workout-sets/:setId', async (req, res) => {
 });
 
 // DELETE /api/workouts/:workoutId — delete a workout and all its sets
-app.delete('/api/workouts/:workoutId', async (req, res) => {
+app.delete('/api/workouts/:workoutId', auth, async (req, res) => {
   try {
     const { workoutId } = req.params;
     const userId = req.body?.userId || req.query.userId;
@@ -4601,7 +4723,7 @@ app.delete('/api/workouts/:workoutId', async (req, res) => {
       .eq('id', workoutId)
       .maybeSingle();
     if (!logRow) return res.status(404).json({ error: 'Workout not found' });
-    if (logRow.user_id !== userId) return res.status(403).json({ error: 'Forbidden' });
+    if (logRow.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     // Delete child sets first (in case no CASCADE is set in the schema)
     await supabase.from('workout_set_logs').delete().eq('workout_log_id', workoutId);
@@ -4619,12 +4741,18 @@ app.delete('/api/workouts/:workoutId', async (req, res) => {
 require('./trainerRoutes')(app, supabase);
 
 // ── User workout plans ──────────────────────────────────
-app.get('/api/user-plans/:userId', async (req, res) => {
+app.get('/api/user-plans/:userId', auth, async (req, res) => {
   try {
+    const { userId } = req.params;
+    if (userId !== req.user.id) {
+      // Trainers build/view a linked client's workout plans via UserPlanBuilder.
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, userId);
+      if (!isTrainer) return res.status(403).json({ error: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('user_workout_plans')
       .select('*')
-      .eq('user_id', req.params.userId)
+      .eq('user_id', userId)
       .eq('is_active', true)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -4634,10 +4762,14 @@ app.get('/api/user-plans/:userId', async (req, res) => {
   }
 });
 
-app.post('/api/user-plans', async (req, res) => {
+app.post('/api/user-plans', auth, async (req, res) => {
   try {
     const { userId, name, description, planData } = req.body;
     if (!userId || !name) return res.status(400).json({ error: 'userId and name required' });
+    if (userId !== req.user.id) {
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, userId);
+      if (!isTrainer) return res.status(403).json({ error: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('user_workout_plans')
       .insert({ user_id: userId, name, description: description || '', plan_data: planData || {} })
@@ -4649,8 +4781,20 @@ app.post('/api/user-plans', async (req, res) => {
   }
 });
 
-app.patch('/api/user-plans/:planId', async (req, res) => {
+app.patch('/api/user-plans/:planId', auth, async (req, res) => {
   try {
+    const { data: planRow, error: lookupErr } = await supabase
+      .from('user_workout_plans')
+      .select('user_id')
+      .eq('id', req.params.planId)
+      .maybeSingle();
+    if (lookupErr) throw lookupErr;
+    if (!planRow) return res.status(404).json({ error: 'Plan not found' });
+    if (planRow.user_id !== req.user.id) {
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, planRow.user_id);
+      if (!isTrainer) return res.status(403).json({ error: 'Forbidden' });
+    }
+
     const updates = { ...req.body, updated_at: new Date().toISOString() };
     delete updates.user_id;
     const { data, error } = await supabase
@@ -4665,8 +4809,20 @@ app.patch('/api/user-plans/:planId', async (req, res) => {
   }
 });
 
-app.delete('/api/user-plans/:planId', async (req, res) => {
+app.delete('/api/user-plans/:planId', auth, async (req, res) => {
   try {
+    const { data: planRow, error: lookupErr } = await supabase
+      .from('user_workout_plans')
+      .select('user_id')
+      .eq('id', req.params.planId)
+      .maybeSingle();
+    if (lookupErr) throw lookupErr;
+    if (!planRow) return res.status(404).json({ error: 'Plan not found' });
+    if (planRow.user_id !== req.user.id) {
+      const isTrainer = await isActiveTrainerOfClient(req.user.id, planRow.user_id);
+      if (!isTrainer) return res.status(403).json({ error: 'Forbidden' });
+    }
+
     const { error } = await supabase
       .from('user_workout_plans')
       .delete()
@@ -4681,7 +4837,7 @@ app.delete('/api/user-plans/:planId', async (req, res) => {
 // ── Consumer Settings Routes ──────────────────────────────────────────────────
 
 // GET /api/users/lookup-user?email=X  — resolve email → { userId, fullName }
-app.get('/api/users/lookup-user', async (req, res) => {
+app.get('/api/users/lookup-user', auth, async (req, res) => {
   try {
     const { email } = req.query;
     if (!email || !email.trim()) {
@@ -4722,9 +4878,12 @@ app.get('/api/users/lookup-user', async (req, res) => {
   }
 });
 
-app.get('/api/users/:userId', async (req, res) => {
+app.get('/api/users/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (req.user.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     const { data, error } = await supabase
       .from('users')
       .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, role, gym_id, created_at')
@@ -4740,9 +4899,12 @@ app.get('/api/users/:userId', async (req, res) => {
   }
 });
 
-app.patch('/api/users/:userId', async (req, res) => {
+app.patch('/api/users/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
+    if (req.user.id !== userId) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     const body = req.body;
     
     const allowed = [
@@ -4793,15 +4955,19 @@ app.patch('/api/users/:userId', async (req, res) => {
   }
 });
 
-app.post('/api/users/:userId/change-password', async (req, res) => {
+app.post('/api/users/:userId/change-password', auth, async (req, res) => {
   try {
     const { userId } = req.params;
     const { new_password } = req.body;
-    
+
+    if (req.user.id !== userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
     if (!new_password || new_password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long' });
     }
-    
+
     // Requires SUPABASE_SERVICE_KEY (service role key)
     const { error } = await supabase.auth.admin.updateUserById(userId, {
       password: new_password
@@ -4815,16 +4981,11 @@ app.post('/api/users/:userId/change-password', async (req, res) => {
   }
 });
 
-app.delete('/api/users/:userId', async (req, res) => {
+app.delete('/api/users/:userId', auth, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Verify the requesting user matches the target userId
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
-    const { data: authData, error: authErr } = await supabase.auth.getUser(token);
-    if (authErr || authData?.user?.id !== userId) {
+    if (req.user.id !== userId) {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
@@ -4860,7 +5021,7 @@ app.delete('/api/users/:userId', async (req, res) => {
     const { error: convErr } = await supabase
       .from('conversations')
       .delete()
-      .or(`client_id.eq.${userId},trainer_id.eq.${userId}`);
+      .or(`participant_1_id.eq.${userId},participant_2_id.eq.${userId}`);
     if (convErr) throw convErr;
 
     const { error: tcErr } = await supabase

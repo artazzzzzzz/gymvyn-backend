@@ -648,7 +648,7 @@ async function main() {
       current_streak: total >= 5000 ? 12 : total >= 1000 ? 5 : 1,
       longest_streak: total >= 5000 ? 30 : total >= 1000 ? 10 : 2,
       streak_multiplier: 1.0, last_active_date: dateStr(today),
-      freezes_remaining: 6, freezes_reset_at: firstOfMonth,
+      freezes_remaining: 9, freezes_reset_at: firstOfMonth,
     });
     // backing xp_events
     const events = [

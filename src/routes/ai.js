@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
+const { auth } = require('../../middleware/auth');
 const { requireFeatureFlag } = require('../middleware/aiFeatureFlag');
 const { aiRateLimit } = require('../middleware/aiRateLimit');
 const { parseVoiceDietLog } = require('../ai/features/voiceDiet');
@@ -10,17 +11,6 @@ const { generateDietPlan } = require('../ai/features/dietPlanGeneration');
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
-// ── Auth middleware ────────────────────────────────────────────────────────────
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-  req.userId = data.user.id;
-  next();
-}
 
 // ── Multer — audio upload, memory storage, 5MB cap ───────────────────────────
 const audioUpload = multer({
@@ -103,9 +93,23 @@ router.post(
 
 // ── POST /api/ai/voice/diet/save ─────────────────────────────────────────────
 router.post('/voice/diet/save', auth, async (req, res) => {
-  const { meal_type, items, log_date } = req.body;
+  const { meal_type, items, log_date, diet_plan_id, plan_day, plan_item_index } = req.body;
   if (!meal_type || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'INVALID_BODY', message: 'meal_type and items[] are required.' });
+  }
+
+  // If this save is confirming an AI diet-plan item, verify the plan belongs
+  // to the caller before tagging log rows with it.
+  if (diet_plan_id) {
+    const { data: planRow } = await supabase
+      .from('user_diet_plans')
+      .select('id')
+      .eq('id', diet_plan_id)
+      .eq('user_id', req.userId)
+      .maybeSingle();
+    if (!planRow) {
+      return res.status(403).json({ error: 'NOT_AUTHORIZED', message: 'Not your diet plan.' });
+    }
   }
 
   // Use client's local date if provided; otherwise derive IST date (UTC+5:30)
@@ -124,6 +128,8 @@ router.post('/voice/diet/save', auth, async (req, res) => {
     fat_g:     item.fat_g,
     quantity:  item.quantity,
     serving_unit: item.unit,
+    logged_via: diet_plan_id ? 'plan' : 'voice',
+    ...(diet_plan_id ? { diet_plan_id, plan_day, plan_item_index } : {}),
   }));
 
   const { data, error } = await supabase.from('food_logs').insert(rows).select('id');
