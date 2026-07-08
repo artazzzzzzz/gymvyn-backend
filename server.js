@@ -1640,10 +1640,11 @@ app.post('/api/gym-trainers/invite', auth, async (req, res) => {
     if (lookupErr && lookupErr.code !== 'PGRST116') throw lookupErr;
 
     if (existing) {
-      // Already exists — update status to 'invited'
+      // Already exists — reset to the correct pending status for re-invite
+      const pendingStatus = type === 'phone' ? 'phone_invited' : 'invited';
       const { data: updated, error: updateErr } = await supabase
         .from('trainer_profiles')
-        .update({ status: 'invited' })
+        .update({ status: pendingStatus })
         .eq('id', existing.id)
         .select()
         .single();
@@ -1655,25 +1656,84 @@ app.post('/api/gym-trainers/invite', auth, async (req, res) => {
     // ── Create new trainer_profiles row ──────────────────────────────────────
     const invite_code = Math.random().toString(36).substring(2, 10).toUpperCase();
     const id = crypto.randomUUID();
-    const newRow = {
-      id,
-      gym_id,
-      full_name: 'Invited Trainer',
-      phone:     type === 'phone' ? value.trim() : null,
-      email:     type === 'email' ? value.trim() : null,
-      specializations:      [],
-      experience_years:     0,
-      is_independent:       false,
-      is_accepting_clients: true,
-      invite_code,
-      status:    'invited',
-      is_active: true,
-      created_at: new Date().toISOString(),
-    };
 
+    if (type === 'email') {
+      // Create an auth user via magic-link invite; the response gives us their
+      // UUID immediately so we can link trainer_profiles before they ever log in.
+      const { data: inviteData, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
+        value.trim(),
+        { data: { full_name: 'Invited Trainer' } }
+      );
+      if (inviteErr) {
+        const msg = inviteErr.message || '';
+        if (/already registered|already been registered|already exists/i.test(msg) || inviteErr.status === 422) {
+          return res.status(409).json({
+            message: 'This email already has a Gymvyn account. Ask the trainer to join using the gym join code instead.',
+          });
+        }
+        throw inviteErr;
+      }
+
+      const userId = inviteData.user.id;
+
+      // Insert users row first (full_name NOT NULL, role defaults to consumer but
+      // we set trainer so checkOnboarding skips the consumer onboarding flow).
+      const { error: usersErr } = await supabase.from('users').insert({
+        id: userId,
+        full_name: 'Invited Trainer',
+        role: 'trainer',
+      });
+      if (usersErr) {
+        await supabase.auth.admin.deleteUser(userId);
+        throw usersErr;
+      }
+
+      const { data: created, error: insertErr } = await supabase
+        .from('trainer_profiles')
+        .insert({
+          id,
+          gym_id,
+          user_id: userId,
+          full_name: 'Invited Trainer',
+          email: value.trim(),
+          specializations:      [],
+          experience_years:     0,
+          is_independent:       false,
+          is_accepting_clients: true,
+          invite_code,
+          status:    'invited',
+          is_active: true,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+      if (insertErr) {
+        await supabase.auth.admin.deleteUser(userId);
+        await supabase.from('users').delete().eq('id', userId);
+        throw insertErr;
+      }
+
+      return res.status(201).json({ success: true, invite_code, trainer: created });
+    }
+
+    // type === 'phone' — placeholder row; user_id stays null until the trainer
+    // signs up and calls POST /api/trainer/claim-invite with this invite_code.
     const { data: created, error: insertErr } = await supabase
       .from('trainer_profiles')
-      .insert(newRow)
+      .insert({
+        id,
+        gym_id,
+        full_name:            'Invited Trainer',
+        phone:                value.trim(),
+        specializations:      [],
+        experience_years:     0,
+        is_independent:       false,
+        is_accepting_clients: true,
+        invite_code,
+        status:    'phone_invited',
+        is_active: true,
+        created_at: new Date().toISOString(),
+      })
       .select()
       .single();
     if (insertErr) throw insertErr;
@@ -1748,7 +1808,8 @@ app.get('/api/gym-trainers/:gymId', auth, async (req, res) => {
       .from('trainer_profiles')
       .select('*')
       .eq('gym_id', gymId)
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .neq('status', 'phone_invited');
     if (profilesErr) throw profilesErr;
 
     if (!profiles || profiles.length === 0) {
