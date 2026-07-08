@@ -25,11 +25,6 @@ const allowedOrigins = [
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 
-// Top-level request probe — remove once 500 is diagnosed
-app.use((req, res, next) => {
-  console.log('>>> HTTP:', req.method, req.url);
-  next();
-});
 
 app.use(express.json({ limit: '15mb' }));
 
@@ -1588,7 +1583,6 @@ app.post('/api/gym-trainers/invite', auth, async (req, res) => {
         .single();
       if (updateErr) throw updateErr;
       const invite_code = updated.invite_code;
-      console.log(`[INVITE] Would send ${type} invite to ${value} with code ${invite_code}`);
       return res.status(200).json({ success: true, invite_code, trainer: updated });
     }
 
@@ -1618,7 +1612,6 @@ app.post('/api/gym-trainers/invite', auth, async (req, res) => {
       .single();
     if (insertErr) throw insertErr;
 
-    console.log(`[INVITE] Would send ${type} invite to ${value} with code ${invite_code}`);
     res.status(201).json({ success: true, invite_code, trainer: created });
   } catch (err) {
     console.error('POST /api/gym-trainers/invite error:', err);
@@ -2106,8 +2099,6 @@ app.post('/api/gym-payments/send-reminders', auth, async (req, res) => {
       phone:     p.users?.phone     ?? null,
       amount:    p.amount,
     }));
-
-    console.log('Would send reminders to:', members);
 
     res.json({
       success:        true,
@@ -3171,8 +3162,6 @@ app.get('/api/gym-occupancy/:gymId', auth, async (req, res) => {
       .eq('gym_id', gymId)
       .gte('checked_in_at', todayMidnightIso());
     if (totalErr) throw totalErr;
-
-    console.log(`[OCCUPANCY] gymId=${gymId} occupancy=${current_occupancy} at ${new Date().toISOString()}`);
 
     res.json({
       current_occupancy,
