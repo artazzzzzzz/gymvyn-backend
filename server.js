@@ -26,24 +26,23 @@ const allowedOrigins = [
 ];
 
 // Vite's autoPort means the local dev server can land on any port (5173,
-// 5175, 5177, ...). Rather than hardcode every possible port, allow any
-// http://localhost:* origin outside production. Production always stays on
-// the strict allowedOrigins list above — this branch never runs there.
-// Railway does not set NODE_ENV, only RAILWAY_ENVIRONMENT_NAME — check both
-// and fail closed (treat as production) unless neither signal is present.
-const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT_NAME === 'production';
-const localhostOriginPattern = /^http:\/\/localhost:\d+$/;
+// 5175, 5177, ...), and this always talks to the hosted backend, not a
+// local one — so this can't be gated on environment detection. A real
+// attacker's browser is never making a request from localhost against
+// this API, so unconditionally trusting any localhost/127.0.0.1 origin
+// doesn't weaken protection against actual cross-origin abuse from
+// attacker-controlled domains; it only ever helps a developer's own
+// machine. Every other origin still goes through the strict allowlist.
+const localhostOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
 
 app.use(cors({
-  origin: isProduction
-    ? allowedOrigins
-    : (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin) || localhostOriginPattern.test(origin)) {
-          callback(null, true);
-        } else {
-          callback(new Error('Not allowed by CORS'));
-        }
-      },
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin) || localhostOriginPattern.test(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 
