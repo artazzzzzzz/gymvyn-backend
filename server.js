@@ -132,7 +132,7 @@ cloudinary.config({
 const storage = new CloudinaryStorage({
   cloudinary,
   params: {
-    folder: 'fitforge/progress',
+    folder: 'gymvyn/progress',
     allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
   },
 });
@@ -221,7 +221,7 @@ app.post('/chat', auth, async (req, res) => {
   try {
     const { message, history = [], userProfile = {} } = req.body;
 
-    const systemPrompt = `You are FitForge AI, an expert fitness coach and nutritionist specializing in Indian gym culture. Help users with workouts, diet, form tips, supplements, and motivation. Keep responses concise and practical. Consider Indian food preferences for diet advice. Never give medical advice.\n\nUser Profile:\n${JSON.stringify(userProfile, null, 2)}`;
+    const systemPrompt = `You are the Gymvyn AI Coach, an expert fitness coach and nutritionist specializing in Indian gym culture. Help users with workouts, diet, form tips, supplements, and motivation. Keep responses concise and practical. Consider Indian food preferences for diet advice. Never give medical advice.\n\nUser Profile:\n${JSON.stringify(userProfile, null, 2)}`;
 
     const contents = [
       ...history.map(({ role, content }) => ({
@@ -518,7 +518,7 @@ app.post('/api/gyms/:gymId/upload-logo', auth, requireGymOwner, logoMemUpload.si
     const result = await new Promise((resolve, reject) => {
       cloudinary.uploader.upload_stream(
         {
-          folder:     'fitforge/gyms',
+          folder:     'gymvyn/gyms',
           public_id:  `gym-logo-${gymId}`,
           overwrite:  true,
           transformation: [

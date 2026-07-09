@@ -193,11 +193,11 @@ async function getAlreadyUploaded() {
 }
 
 async function uploadOne(video, idx, total) {
-  const publicId = `fitforge/exercises/${slugify(video.matchedName)}`;
+  const publicId = `gymvyn/exercises/${slugify(video.matchedName)}`;
 
   const result = await cloudinary.uploader.upload(video.fullPath, {
     resource_type: 'video',
-    folder:        'fitforge/exercises',
+    folder:        'gymvyn/exercises',
     public_id:     slugify(video.matchedName),
     overwrite:     true,
     use_filename:  false,

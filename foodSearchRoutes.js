@@ -159,7 +159,7 @@ module.exports = function (app, supabase) {
         if (localResults?.length) {
           results = localResults.map(item => ({
             ...item,
-            source_label: item.source === 'openfoodfacts' ? 'Open Food Facts' : 'FitForge',
+            source_label: item.source === 'openfoodfacts' ? 'Open Food Facts' : 'Gymvyn',
           }));
         }
       }
@@ -276,7 +276,7 @@ module.exports = function (app, supabase) {
         .single();
 
       if (cached) {
-        return res.json({ ...cached, source_label: 'FitForge Cache' });
+        return res.json({ ...cached, source_label: 'Gymvyn Cache' });
       }
 
       // 2. Fetch from Open Food Facts

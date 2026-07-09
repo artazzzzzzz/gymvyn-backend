@@ -28,7 +28,7 @@ async function main() {
 
   const result = await cloudinary.uploader.upload(VIDEO_PATH, {
     resource_type: 'video',
-    folder: 'fitforge/exercises',
+    folder: 'gymvyn/exercises',
     public_id: 'barbell-bench-press',
     overwrite: true,
   });

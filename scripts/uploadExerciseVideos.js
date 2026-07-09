@@ -108,7 +108,7 @@ function matchVideos(videoPaths, exerciseNames) {
 // ── Upload to Cloudinary and upsert to Supabase ───────────────────────────────
 
 async function uploadVideo(filepath, exerciseName) {
-  const publicId = `fitforge/exercises/${slugify(exerciseName)}`;
+  const publicId = `gymvyn/exercises/${slugify(exerciseName)}`;
 
   const result = await cloudinary.uploader.upload(filepath, {
     resource_type: 'video',
