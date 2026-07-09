@@ -25,7 +25,27 @@ const allowedOrigins = [
   'http://localhost:3000',
 ];
 
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+// Vite's autoPort means the local dev server can land on any port (5173,
+// 5175, 5177, ...). Rather than hardcode every possible port, allow any
+// http://localhost:* origin outside production. Production always stays on
+// the strict allowedOrigins list above — this branch never runs there.
+// Railway does not set NODE_ENV, only RAILWAY_ENVIRONMENT_NAME — check both
+// and fail closed (treat as production) unless neither signal is present.
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT_NAME === 'production';
+const localhostOriginPattern = /^http:\/\/localhost:\d+$/;
+
+app.use(cors({
+  origin: isProduction
+    ? allowedOrigins
+    : (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin) || localhostOriginPattern.test(origin)) {
+          callback(null, true);
+        } else {
+          callback(new Error('Not allowed by CORS'));
+        }
+      },
+  credentials: true,
+}));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 
