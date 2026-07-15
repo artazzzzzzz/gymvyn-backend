@@ -5227,6 +5227,8 @@ app.use('/api/ai', require('./src/routes/ai'));
 
 app.use('/api/client-diet-plans', require('./routes/clientDietPlanRoutes'));
 
+app.use('/api/member-imports', require('./routes/memberImportRoutes'));
+
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');
 
