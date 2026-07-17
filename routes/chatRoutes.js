@@ -1,6 +1,8 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { canMessage, getOrCreateConversationIfAllowed, getGymContexts, sharedGymId } = require('../src/utils/canMessage');
+const { auth } = require('../middleware/auth');
+const { validateMessageContent, sendMessageAtomically, markConversationRead } = require('../src/services/chatService');
 
 const router = express.Router();
 
@@ -8,18 +10,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.userId = data.user.id;
-  next();
-}
 
 // GET /api/chat/conversations
 router.get('/conversations', auth, async (req, res) => {
@@ -124,11 +114,7 @@ router.get('/messages/:conversationId', auth, async (req, res) => {
     const messages = (rawMessages || []).map(m => ({ ...m, sender: sendersById.get(m.sender_id) || null }));
 
     // Reset unread counter for reading user
-    const unreadField = isP1 ? 'p1_unread' : 'p2_unread';
-    await supabase
-      .from('conversations')
-      .update({ [unreadField]: 0 })
-      .eq('id', conversationId);
+    await markConversationRead(supabase, { conversationId, readerId: userId });
 
     res.json(messages || []);
   } catch (err) {
@@ -140,16 +126,15 @@ router.get('/messages/:conversationId', auth, async (req, res) => {
 router.post('/message', auth, async (req, res) => {
   try {
     const userId = req.userId;
-    const { conversationId, content } = req.body;
-
-    if (!conversationId || !content?.trim()) {
-      return res.status(400).json({ error: 'conversationId and content are required' });
-    }
+    const { conversationId, content } = req.body || {};
+    if (!conversationId) return res.status(400).json({ error: 'conversationId is required' });
+    const validContent = validateMessageContent(content);
+    if (validContent.error) return res.status(400).json({ error: validContent.error });
 
     // Security: verify caller is a participant
     const { data: convo, error: convoErr } = await supabase
       .from('conversations')
-      .select('id, participant_1_id, participant_2_id, p1_unread, p2_unread')
+      .select('id, participant_1_id, participant_2_id')
       .eq('id', conversationId)
       .maybeSingle();
 
@@ -165,21 +150,9 @@ router.post('/message', auth, async (req, res) => {
       return res.status(403).json({ error: 'Messaging is no longer permitted between these users' });
     }
 
-    // Insert message. messages has no message_type column in the real
-    // schema (PGRST204 when present) and no FK to users for an embedded
-    // select (as above) — insert plain columns only, then attach sender
-    // info from a separate lookup.
-    const { data: msg, error: msgErr } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id: conversationId,
-        sender_id: userId,
-        content: content.trim(),
-      })
-      .select('*')
-      .single();
-
-    if (msgErr) throw msgErr;
+    const msg = await sendMessageAtomically(supabase, {
+      conversationId, senderId: userId, content: validContent.value,
+    });
 
     const { data: sender } = await supabase
       .from('users')
@@ -187,17 +160,6 @@ router.post('/message', auth, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
     msg.sender = sender || null;
-
-    // Update conversation: bump unread for the OTHER participant
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_at: new Date().toISOString(),
-        last_message_preview: content.trim().substring(0, 60),
-        p1_unread: isP1 ? convo.p1_unread : (convo.p1_unread || 0) + 1,
-        p2_unread: isP2 ? convo.p2_unread : (convo.p2_unread || 0) + 1,
-      })
-      .eq('id', conversationId);
 
     res.json(msg);
   } catch (err) {

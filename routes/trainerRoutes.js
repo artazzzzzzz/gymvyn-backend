@@ -2,6 +2,14 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
 const { getOrCreateConversationIfAllowed } = require('../src/utils/canMessage');
+const { sendMessageAtomically } = require('../src/services/chatService');
+const {
+  ACTIVE_RELATIONSHIP_STATUSES,
+  getActiveTrainerClientLink,
+  getCurrentTrainerClientLinkForClient,
+  deactivateOtherTrainerClientLinks,
+  deactivateAllTrainerClientLinks,
+} = require('../src/utils/relationshipAuth');
 
 const router = express.Router();
 
@@ -13,14 +21,7 @@ const supabase = createClient(
 // Checks for an active trainer_clients row linking the two ids in this
 // exact direction (trainerId is the trainer, clientId is the client).
 async function isLinkedPair(trainerId, clientId) {
-  const { data } = await supabase
-    .from('trainer_clients')
-    .select('id')
-    .eq('trainer_id', trainerId)
-    .eq('client_id', clientId)
-    .eq('status', 'active')
-    .maybeSingle();
-  return !!data;
+  return !!(await getActiveTrainerClientLink(supabase, trainerId, clientId));
 }
 
 // ──────────────────────────────────────────
@@ -222,12 +223,15 @@ router.get('/clients/:trainerId', auth, async (req, res) => {
 router.get('/my-trainer/:clientId', auth, async (req, res) => {
   try {
     const { clientId } = req.params;
-    if (req.user.id !== clientId) {
-      const linked = await isLinkedPair(req.user.id, clientId);
-      if (!linked) return res.status(403).json({ error: 'Not authorized' });
-    }
+    const selfAccess = req.user.id === clientId;
+    const activeLink = selfAccess
+      ? await getCurrentTrainerClientLinkForClient(supabase, clientId)
+      : await getActiveTrainerClientLink(supabase, req.user.id, clientId);
 
-    const { data: rel, error } = await supabase
+    if (!selfAccess && !activeLink) return res.status(403).json({ error: 'Not authorized' });
+    if (selfAccess && !activeLink) return res.json(null);
+
+    let relQuery = supabase
       .from('trainer_clients')
       .select(`
         *,
@@ -235,9 +239,10 @@ router.get('/my-trainer/:clientId', auth, async (req, res) => {
           id, full_name
         )
       `)
-      .eq('client_id', clientId)
-      .eq('status', 'active')
-      .single();
+      .eq('id', activeLink.id)
+      .in('status', ACTIVE_RELATIONSHIP_STATUSES);
+
+    const { data: rel, error } = await relQuery.single();
 
     if (error && error.code !== 'PGRST116') throw error;
     if (!rel) return res.json(null);
@@ -481,36 +486,15 @@ router.post('/assign-plan', auth, async (req, res) => {
     // the real table (participant_1_id/participant_2_id) — the lookup's
     // error was never checked, so this whole block silently no-op'd.
     // trainer-client eligibility was already confirmed above via
-    // isLinkedPair, so this always succeeds; get_or_create_conversation is
+    // isLinkedPair, so this always succeeds; the hardened conversation RPC is
     // idempotent if one already exists from the invite/accept flow.
     const convoId = await getOrCreateConversationIfAllowed(supabase, trainerId, clientId);
 
     if (convoId) {
-      // messages has no message_type/metadata columns in the real schema —
-      // the plan_share rich-message rendering ChatWindow.jsx expects isn't
-      // backed by any column today; out of scope for this permission fix,
-      // flagging rather than inventing a schema change here.
-      await supabase.from('messages').insert({
-        conversation_id: convoId,
-        sender_id: trainerId,
+      await sendMessageAtomically(supabase, {
+        conversationId: convoId,
+        senderId: trainerId,
         content: `Assigned new ${type} plan: ${name}`,
-      });
-
-      const { data: convo } = await supabase
-        .from('conversations')
-        .select('participant_1_id')
-        .eq('id', convoId)
-        .single();
-
-      await supabase.from('conversations').update({
-        last_message_at: new Date().toISOString(),
-        last_message_preview: `New ${type} plan: ${name}`
-      }).eq('id', convoId);
-
-      const clientIsP1 = convo?.participant_1_id === clientId;
-      await supabase.rpc('increment_unread', {
-        convo_id: convoId,
-        field_name: clientIsP1 ? 'p1_unread' : 'p2_unread'
       });
     }
 
@@ -525,16 +509,17 @@ router.post('/assign-plan', auth, async (req, res) => {
 router.get('/assigned-plans/:clientId', auth, async (req, res) => {
   try {
     const { clientId } = req.params;
-    if (req.user.id !== clientId) {
-      const linked = await isLinkedPair(req.user.id, clientId);
-      if (!linked) return res.status(403).json({ error: 'Not authorized' });
-    }
+    const selfAccess = req.user.id === clientId;
+    const activeLink = selfAccess ? null : await getActiveTrainerClientLink(supabase, req.user.id, clientId);
+    if (!selfAccess && !activeLink) return res.status(403).json({ error: 'Not authorized' });
 
     let query = supabase
       .from('assigned_plans')
       .select('*, trainer:users!assigned_plans_trainer_id_fkey(full_name)')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false });
+
+    if (!selfAccess) query = query.eq('trainer_id', req.user.id);
 
     if (req.query.status) query = query.eq('status', req.query.status);
     if (req.query.type) query = query.eq('type', req.query.type);
@@ -807,14 +792,16 @@ router.post('/join', auth, async (req, res) => {
       .eq('client_id', req.user.id)
       .maybeSingle();
 
-    if (existing?.status === 'active') {
+    if (existing && ACTIVE_RELATIONSHIP_STATUSES.includes(existing.status)) {
       return res.status(400).json({ error: 'Already linked to this trainer' });
     }
+
+    await deactivateOtherTrainerClientLinks(supabase, req.user.id, trainerId);
 
     if (existing) {
       const { error: updErr } = await supabase
         .from('trainer_clients')
-        .update({ status: 'active' })
+        .update({ status: 'active', started_at: new Date().toISOString(), updated_at: new Date().toISOString() })
         .eq('id', existing.id);
       if (updErr) throw updErr;
     } else {
@@ -862,11 +849,24 @@ router.get('/pending-invites', auth, async (req, res) => {
 // PATCH /api/trainer/accept-invite/:id — client accepts a pending invite
 router.patch('/accept-invite/:id', auth, async (req, res) => {
   try {
+    const { data: rel, error: relErr } = await supabase
+      .from('trainer_clients')
+      .select('id, trainer_id')
+      .eq('id', req.params.id)
+      .eq('client_id', req.user.id)
+      .eq('status', 'pending')
+      .maybeSingle();
+    if (relErr) throw relErr;
+    if (!rel) return res.status(404).json({ error: 'Invite not found' });
+
+    await deactivateOtherTrainerClientLinks(supabase, req.user.id, rel.trainer_id);
+
     const { error } = await supabase
       .from('trainer_clients')
       .update({ status: 'active', started_at: new Date().toISOString() })
       .eq('id', req.params.id)
-      .eq('client_id', req.user.id);
+      .eq('client_id', req.user.id)
+      .eq('status', 'pending');
 
     if (error) throw error;
     res.json({ success: true });
@@ -896,14 +896,17 @@ router.delete('/decline-invite/:id', auth, async (req, res) => {
 // GET /api/trainer/my-trainer — authenticated consumer gets their linked trainer + active plan
 router.get('/my-trainer', auth, async (req, res) => {
   try {
+    const activeLink = await getCurrentTrainerClientLinkForClient(supabase, req.user.id);
+    if (!activeLink) return res.status(404).json({ error: 'No trainer linked' });
+
     const { data: rel, error: relErr } = await supabase
       .from('trainer_clients')
       .select(`
         id, trainer_id,
         trainer:users!trainer_clients_trainer_id_fkey(id, full_name)
       `)
-      .eq('client_id', req.user.id)
-      .eq('status', 'active')
+      .eq('id', activeLink.id)
+      .in('status', ACTIVE_RELATIONSHIP_STATUSES)
       .maybeSingle();
 
     if (relErr) throw relErr;
@@ -919,17 +922,18 @@ router.get('/my-trainer', auth, async (req, res) => {
       .from('assigned_plans')
       .select('id, type, name, notes, starts_at, plan_data, status')
       .eq('client_id', req.user.id)
+      .eq('trainer_id', rel.trainer_id)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
       .limit(1);
 
-    // Real conversations schema is participant_1_id/participant_2_id, not
-    // trainer_id/client_id — this used to select nonexistent columns and
-    // silently return `conversation: null` always (error wasn't checked).
+    // Real conversations schema is participant_1_id/participant_2_id. Match
+    // the current active member/trainer pair exactly so an old conversation
+    // with a previous trainer cannot leak into this response.
     const { data: convos } = await supabase
       .from('conversations')
       .select('id, last_message_preview, last_message_at, p1_unread, p2_unread, participant_1_id, participant_2_id')
-      .or(`participant_1_id.eq.${req.user.id},participant_2_id.eq.${req.user.id}`)
+      .or(`and(participant_1_id.eq.${req.user.id},participant_2_id.eq.${rel.trainer_id}),and(participant_1_id.eq.${rel.trainer_id},participant_2_id.eq.${req.user.id})`)
       .order('last_message_at', { ascending: false, nullsFirst: false })
       .limit(1);
 
@@ -976,23 +980,8 @@ router.patch('/unlink', auth, async (req, res) => {
   try {
     const clientId = req.user.id;
 
-    const { data: rel, error: relErr } = await supabase
-      .from('trainer_clients')
-      .select('id')
-      .eq('client_id', clientId)
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (relErr) throw relErr;
-    if (!rel) return res.status(404).json({ error: 'No active trainer found' });
-
-    const { error: updErr } = await supabase
-      .from('trainer_clients')
-      .update({ status: 'removed', updated_at: new Date().toISOString() })
-      .eq('id', rel.id)
-      .eq('client_id', clientId);
-    if (updErr) throw updErr;
+    const removedIds = await deactivateAllTrainerClientLinks(supabase, clientId);
+    if (removedIds.length === 0) return res.status(404).json({ error: 'No active trainer found' });
 
     res.json({ success: true });
   } catch (err) {
