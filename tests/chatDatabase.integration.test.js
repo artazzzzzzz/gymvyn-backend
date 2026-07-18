@@ -34,6 +34,8 @@ test('test harness is explicitly local and isolated', { skip: !DB || !PHASE }, (
   assert.ok(['phase1', 'phase2'].includes(PHASE));
   assert.equal(value('SELECT current_database()'), DB);
   assert.equal(value("SELECT to_regclass('public.conversations') IS NOT NULL"), 't');
+  assert.equal(value("SELECT to_regclass('public.friendships') IS NOT NULL"), 't');
+  assert.equal(value("SELECT to_regclass('public.user_blocks') IS NOT NULL"), 't');
 });
 
 if (PHASE === 'phase1') {
@@ -66,6 +68,7 @@ if (PHASE === 'phase1') {
     assert.equal(value(`SELECT count(*) FROM public.trainer_clients WHERE trainer_id='${TRAINER}' AND client_id='${CLIENT}' AND status='active'`), '1');
     assert.equal(value(`SELECT count(*) FROM public.gym_memberships WHERE user_id='${CLIENT}' AND status='active' AND (end_date IS NULL OR end_date >= current_date)`), '0');
     assert.equal(value(`SELECT count(*) FROM public.buddy_requests WHERE sender_id='${MEMBER}' AND receiver_id='${CLIENT}' AND status='accepted'`), '1');
+    assert.equal(value(`SELECT count(*) FROM public.friendships WHERE participant_1_id='${MEMBER}' AND participant_2_id='${OUTSIDER}' AND status='accepted'`), '1');
   });
 }
 

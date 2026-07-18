@@ -212,6 +212,13 @@ async function candidateContactIds(supabase, userId) {
   if (buddyErr) throw buddyErr;
   (buddyRows || []).forEach(r => { ids.add(r.sender_id); ids.add(r.receiver_id); });
 
+  const { data: friendRows, error: friendErr } = await supabase
+    .from('friendships')
+    .select('participant_1_id, participant_2_id')
+    .or(`participant_1_id.eq.${userId},participant_2_id.eq.${userId}`);
+  if (friendErr) throw friendErr;
+  (friendRows || []).forEach(r => { ids.add(r.participant_1_id); ids.add(r.participant_2_id); });
+
   ids.delete(userId);
   ids.delete(null);
   ids.delete(undefined);

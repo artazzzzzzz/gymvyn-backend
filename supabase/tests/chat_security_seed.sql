@@ -10,3 +10,4 @@ INSERT INTO public.gym_memberships(gym_id,user_id,status,end_date) VALUES ('1000
 INSERT INTO public.trainer_profiles(user_id,gym_id,is_active,status) VALUES ('00000000-0000-0000-0000-000000000004','10000000-0000-0000-0000-000000000001',true,'active');
 INSERT INTO public.trainer_clients(trainer_id,client_id,gym_id,status) VALUES ('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000005','10000000-0000-0000-0000-000000000001','active');
 INSERT INTO public.buddy_requests(sender_id,receiver_id,gym_id,status) VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000005','10000000-0000-0000-0000-000000000001','accepted');
+INSERT INTO public.friendships(participant_1_id,participant_2_id,requester_id,status) VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000006','00000000-0000-0000-0000-000000000003','accepted');

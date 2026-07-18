@@ -3,6 +3,8 @@
 //
 // Rule set (see migrations/ for the tables referenced):
 //   member <-> their trainer            : trainer_clients, status='active'
+//   accepted friends                    : friendships, status='accepted'
+//   blocked users                       : user_blocks always deny before every allow
 //   buyer <-> seller of a marketplace    : marketplace_purchases,
 //     purchase                             status != 'cancelled' (deliberately
 //                                           cross-gym — the whole point of the
@@ -77,6 +79,24 @@ async function isLinkedTrainerClient(supabase, userA, userB) {
       `and(trainer_id.eq.${userA},client_id.eq.${userB}),and(trainer_id.eq.${userB},client_id.eq.${userA})`
     )
     .limit(1);
+  if (error) throw error;
+  return (data || []).length > 0;
+}
+
+function canonicalPair(userA, userB) {
+  return userA < userB ? [userA, userB] : [userB, userA];
+}
+
+async function isBlocked(supabase, userA, userB) {
+  const [p1, p2] = canonicalPair(userA, userB);
+  const { data, error } = await supabase.from('user_blocks').select('id').eq('participant_1_id', p1).eq('participant_2_id', p2).limit(1);
+  if (error) throw error;
+  return (data || []).length > 0;
+}
+
+async function isAcceptedFriend(supabase, userA, userB) {
+  const [p1, p2] = canonicalPair(userA, userB);
+  const { data, error } = await supabase.from('friendships').select('id').eq('participant_1_id', p1).eq('participant_2_id', p2).eq('status', 'accepted').limit(1);
   if (error) throw error;
   return (data || []).length > 0;
 }
@@ -174,6 +194,12 @@ function sharedGymId(gymsA, gymsB) {
 async function canMessage(supabase, userA, userB) {
   if (!userA || !userB || userA === userB) return false;
 
+  // A block is an absolute override over friends, gym, trainer-client,
+  // buddy, and marketplace relationships.
+  if (await isBlocked(supabase, userA, userB)) return false;
+
+  if (await isAcceptedFriend(supabase, userA, userB)) return true;
+
   // trainer <-> their client
   if (await isLinkedTrainerClient(supabase, userA, userB)) return true;
 
@@ -234,4 +260,4 @@ async function getOrCreateConversationIfAllowed(supabase, userA, userB) {
   return data;
 }
 
-module.exports = { canMessage, getOrCreateConversationIfAllowed, getGymContexts, sharedGymId, activeMembershipGymIds };
+module.exports = { canMessage, getOrCreateConversationIfAllowed, getGymContexts, sharedGymId, activeMembershipGymIds, isBlocked, isAcceptedFriend, canonicalPair };

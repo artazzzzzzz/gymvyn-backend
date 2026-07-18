@@ -5220,6 +5220,7 @@ app.use('/api/equipment', require('./routes/equipmentRoutes'));
 app.use('/api/chat', require('./routes/chatRoutes'));
 
 app.use('/api/trainer-earnings', require('./routes/trainerEarningsRoutes'));
+app.use('/api/friends', require('./routes/friendRoutes'));
 
 app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 

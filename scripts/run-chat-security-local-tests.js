@@ -17,6 +17,7 @@ function runTests(phase) {
 try {
   assertSafe();
   recreateFixture();
+  applyFile(DB_NAME, 'migrations/friendships_and_user_blocks.sql');
   applyFile(DB_NAME, 'migrations/chat_security_phase1_additive.sql');
   runTests('phase1');
   applyFile(DB_NAME, 'migrations/chat_security_phase2_lockdown.sql');

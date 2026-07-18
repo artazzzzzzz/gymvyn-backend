@@ -73,7 +73,7 @@ const activeGymRelationships = {
     { user_id: 'trainer-paused', gym_id: 'gym-a', is_active: true, status: 'paused' },
     { user_id: 'trainer-off', gym_id: 'gym-off', is_active: true, status: 'active' },
   ],
-  trainer_clients: [], marketplace_purchases: [], buddy_requests: [],
+  trainer_clients: [], marketplace_purchases: [], buddy_requests: [], friendships: [], user_blocks: [],
 };
 
 test('chat content validation rejects non-string, blank, and oversized content', () => {
@@ -98,6 +98,26 @@ test('canMessage permits active gym trainer and active member in both directions
   const db = relationshipSupabase(activeGymRelationships);
   assert.equal(await canMessage(db, 'trainer-a', 'member-a'), true);
   assert.equal(await canMessage(db, 'member-a', 'trainer-a'), true);
+});
+
+test('canMessage permits accepted friends cross-gym but rejects pending friends', async () => {
+  const accepted = relationshipSupabase({ ...activeGymRelationships, friendships: [{ participant_1_id: 'friend-a', participant_2_id: 'friend-b', status: 'accepted' }] });
+  const pending = relationshipSupabase({ ...activeGymRelationships, friendships: [{ participant_1_id: 'friend-a', participant_2_id: 'friend-b', status: 'pending' }] });
+  assert.equal(await canMessage(accepted, 'friend-a', 'friend-b'), true);
+  assert.equal(await canMessage(accepted, 'friend-b', 'friend-a'), true);
+  assert.equal(await canMessage(pending, 'friend-a', 'friend-b'), false);
+});
+
+test('canMessage block override denies otherwise valid trainer, gym, and friend relationships', async () => {
+  const db = relationshipSupabase({ ...activeGymRelationships, friendships: [{ participant_1_id: 'friend-a', participant_2_id: 'friend-b', status: 'accepted' }], user_blocks: [
+    { participant_1_id: 'friend-a', participant_2_id: 'friend-b', blocker_id: 'friend-a' },
+    { participant_1_id: 'member-a', participant_2_id: 'trainer-a', blocker_id: 'member-a' },
+    { participant_1_id: 'staff-a', participant_2_id: 'staff-b', blocker_id: 'staff-a' },
+  ] });
+  for (const [a, b] of [['friend-a','friend-b'], ['trainer-a','member-a'], ['staff-a','staff-b']]) {
+    assert.equal(await canMessage(db, a, b), false);
+    assert.equal(await canMessage(db, b, a), false);
+  }
 });
 
 test('canMessage denies inactive, expired, paused, inactive-gym, different-gym, and unrelated users', async () => {
