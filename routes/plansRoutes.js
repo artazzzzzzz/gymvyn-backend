@@ -27,6 +27,18 @@ function listingInput(body) {
   return { value: { templateType, templateId, title, description, inr, usd } };
 }
 
+function purchaseInput(body) {
+  const listingId = String(body?.listingId ?? body?.listing_id ?? '').trim();
+  const currency = String(body?.currency ?? body?.display_currency ?? '').trim().toUpperCase();
+  if (!listingId) return { error: 'listing_id is required' };
+  if (!['INR', 'USD'].includes(currency)) return { error: 'currency must be INR or USD' };
+  return { value: { listingId, currency } };
+}
+
+function commissionMinor(amountMinor, commissionBps) {
+  return Math.round((amountMinor * commissionBps) / 10000);
+}
+
 async function requireActiveTrainer(userId) {
   const { data, error } = await supabase.from('trainer_profiles').select('user_id').eq('user_id', userId).eq('is_active', true).eq('status', 'active').maybeSingle();
   if (error) throw error;
@@ -175,6 +187,50 @@ router.post('/trainer/listings/:id/unpublish', auth, requireTrainerRole, async (
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Purchase creation intentionally stops before provider-order creation, payment
+// verification, or delivery. Those happen in later phases only.
+router.post('/purchases', auth, async (req, res) => {
+  try {
+    const parsed = purchaseInput(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const input = parsed.value;
+    const { data: listing, error: listingError } = await supabase.from('plans_listings').select('*').eq('id', input.listingId).eq('status', 'published').maybeSingle();
+    if (listingError) throw listingError;
+    if (!listing) return res.status(404).json({ error: 'Published listing not found' });
+    if (listing.trainer_id === req.user.id) return res.status(409).json({ error: 'You cannot purchase your own listing' });
+    const amountMinor = input.currency === 'INR' ? listing.price_inr_paise : listing.price_usd_cents;
+    if (!Number.isInteger(amountMinor) || amountMinor <= 0) return res.status(409).json({ error: 'Published listing has no valid price for this currency' });
+    const commissionBps = Number(listing.commission_bps);
+    if (!Number.isInteger(commissionBps) || commissionBps < 0) throw new Error('Listing commission is invalid');
+    const { data: version, error: versionError } = await supabase.from('plans_listing_versions').select('id').eq('listing_id', listing.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (versionError) throw versionError;
+    const { data, error } = await supabase.from('plans_purchases').insert({
+      listing_id: listing.id,
+      listing_version_id: version?.id || null,
+      buyer_id: req.user.id,
+      trainer_id: listing.trainer_id,
+      template_type: listing.template_type,
+      template_id: listing.template_id,
+      currency: input.currency,
+      final_price_minor: amountMinor,
+      commission_bps: commissionBps,
+      commission_minor: commissionMinor(amountMinor, commissionBps),
+      status: 'payment_pending',
+    }).select('id, listing_id, listing_version_id, template_type, currency, final_price_minor, commission_bps, commission_minor, status, created_at').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/purchases/:id', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('plans_purchases').select('id, listing_id, listing_version_id, template_type, currency, final_price_minor, commission_bps, commission_minor, status, delivered_at, created_at').eq('id', req.params.id).eq('buyer_id', req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Purchase not found' });
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.get('/my-purchases', auth, async (req, res) => {
   try {
     const { data, error } = await supabase.from('plans_purchases').select('id, listing_id, template_type, currency, final_price_minor, status, delivered_at, created_at').eq('buyer_id', req.user.id).order('created_at', { ascending: false });
@@ -214,4 +270,4 @@ router.post('/admin/listings/:id/suspend', auth, adminGuardUnavailable);
 router.post('/admin/listings/:id/remove', auth, adminGuardUnavailable);
 
 module.exports = router;
-module.exports._private = { slugify, listingInput, COMMISSION_BPS, PUBLIC_FIELDS };
+module.exports._private = { slugify, listingInput, purchaseInput, commissionMinor, COMMISSION_BPS, PUBLIC_FIELDS };

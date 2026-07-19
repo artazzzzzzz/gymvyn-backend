@@ -37,6 +37,14 @@ test('Gymvyn Plans listing validation permits only workout or diet templates', (
   assert.match(result.error, /workout or diet/);
 });
 
+test('Gymvyn Plans purchase validation accepts only a listing and INR or USD', () => {
+  assert.deepEqual(_private.purchaseInput({ listingId: 'listing-id', currency: 'inr' }).value, { listingId: 'listing-id', currency: 'INR' });
+  assert.match(_private.purchaseInput({ currency: 'INR' }).error, /listing_id/);
+  assert.match(_private.purchaseInput({ listingId: 'listing-id', currency: 'EUR' }).error, /currency/);
+  assert.equal(_private.commissionMinor(2000, 500), 100);
+  assert.equal(_private.commissionMinor(100, 500), 5);
+});
+
 test('Gymvyn Plans exposes the required public, trainer, buyer, review, and guarded admin paths', () => {
   const router = require('../routes/plansRoutes');
   const paths = router.stack
@@ -46,7 +54,7 @@ test('Gymvyn Plans exposes the required public, trainer, buyer, review, and guar
     'GET /listings', 'GET /listings/:slug', 'GET /trainer/listings', 'GET /trainer/templates',
     'POST /trainer/listings', 'PATCH /trainer/listings/:id',
     'POST /trainer/listings/:id/publish', 'POST /trainer/listings/:id/unpublish',
-    'GET /my-purchases', 'GET /listings/:id/reviews',
+    'POST /purchases', 'GET /purchases/:id', 'GET /my-purchases', 'GET /listings/:id/reviews',
     'POST /purchases/:purchaseId/review', 'POST /admin/listings/:id/suspend',
     'POST /admin/listings/:id/remove',
   ]) assert.ok(paths.includes(expected), `missing ${expected}`);
