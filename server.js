@@ -13,6 +13,14 @@ const QRCode = require('qrcode');
 const { auth, requireGymOwner } = require('./middleware/auth');
 const { rateLimit } = require('express-rate-limit');
 const { z } = require('zod');
+const {
+  resolveFoodItemsWithSupabase,
+  resolveFoodNutritionWithSupabase,
+} = require('./utils/foodNutritionResolver');
+const {
+  deactivateOtherGymMemberships,
+  deactivateAllGymMemberships,
+} = require('./src/utils/relationshipAuth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2904,23 +2912,8 @@ app.patch('/api/my-gym/unlink', auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const { data: membershipRow, error: memErr } = await supabase
-      .from('gym_memberships')
-      .select('id, gym_id')
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (memErr) throw memErr;
-    if (!membershipRow) return res.status(404).json({ error: 'No active gym membership found' });
-
-    const { error: updErr } = await supabase
-      .from('gym_memberships')
-      .update({ status: 'inactive', updated_at: new Date().toISOString() })
-      .eq('id', membershipRow.id)
-      .eq('user_id', userId);
-    if (updErr) throw updErr;
+    const removedIds = await deactivateAllGymMemberships(supabase, userId);
+    if (removedIds.length === 0) return res.status(404).json({ error: 'No active gym membership found' });
 
     // users.gym_id is a denormalized convenience pointer several read paths
     // (e.g. supplementRoutes' memberOnly fallback, ConsumerLayout's hasGym
@@ -2983,6 +2976,8 @@ app.post('/api/gym-join', auth, async (req, res) => {
       .limit(1)
       .maybeSingle();
     if (memLookupErr) throw memLookupErr;
+
+    await deactivateOtherGymMemberships(supabase, user_id, gym.id);
 
     if (!existingMembership) {
       const { error: memErr } = await supabase
@@ -4068,6 +4063,27 @@ const ACTIVITY_MULTIPLIERS = {
   very_active: 1.9,
 };
 
+const DIET_PLAN_DIET_TYPES = ['veg', 'non_veg', 'eggetarian'];
+const DIET_PLAN_CUISINES = ['north_indian', 'south_indian', 'gujarati', 'punjabi'];
+
+const dietPlanGenerateSchema = z.object({
+  userId: z.string().uuid().optional(),
+  user_id: z.string().uuid().optional(),
+  dietType: z.enum(DIET_PLAN_DIET_TYPES).optional(),
+  cuisinePref: z.enum(DIET_PLAN_CUISINES).optional(),
+  preferences: z.string().max(500).optional(),
+  dietaryPreferences: z.string().max(500).optional(),
+}).strict('Unknown fields are not allowed');
+
+function sanitizeOptionalPreference(value, maxLength = 500) {
+  if (value == null) return '';
+  return String(value)
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
 async function computeMacrosForUser(userId) {
   const { data: user, error } = await supabase
     .from('users')
@@ -4139,10 +4155,12 @@ async function computeMacrosForUser(userId) {
 }
 
 // Route 1: POST /api/macros/calculate
-app.post('/api/macros/calculate', async (req, res) => {
+app.post('/api/macros/calculate', auth, async (req, res) => {
   try {
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ message: 'userId is required' });
+    const userId = req.body.userId || req.user.id;
+    if (userId !== req.user.id) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
     const macros = await computeMacrosForUser(userId);
     res.json({ success: true, macros });
   } catch (err) {
@@ -4181,29 +4199,46 @@ app.post('/api/food-logs', auth, async (req, res) => {
   try {
     const {
       userId, log_date, date, mealType, foodName, quantity, servingUnit,
-      calories, proteinG, carbsG, fatG, loggedVia, foodId,
+      calories, proteinG, carbsG, fatG, loggedVia, foodId, customFoodId, packagedFoodId,
     } = req.body;
-    if (!userId || !mealType || !foodName || calories == null) {
-      return res.status(400).json({ message: 'userId, mealType, foodName, calories are required' });
+    if (!userId || !mealType || !foodName) {
+      return res.status(400).json({ message: 'userId, mealType, foodName are required' });
     }
     if (userId !== req.user.id) {
       return res.status(403).json({ message: 'Forbidden' });
     }
+
+    const nutritionResolution = await resolveFoodNutritionWithSupabase(supabase, {
+      food_id: foodId,
+      custom_food_id: customFoodId,
+      packaged_food_id: packagedFoodId,
+      user_id: userId,
+      food_name: foodName,
+      quantity: quantity ?? 1,
+      serving_unit: servingUnit,
+      calories,
+      protein_g: proteinG,
+      carbs_g: carbsG,
+      fat_g: fatG,
+    }, { preserveLegacyDefaultServingPayload: true });
+
     const { data, error } = await supabase
       .from('food_logs')
       .insert({
         user_id: userId,
         log_date: log_date || date || new Date().toISOString().slice(0, 10),
         meal_type: mealType,
-        food_name: foodName,
-        quantity: quantity ?? 1,
-        serving_unit: servingUnit ?? null,
-        calories,
-        protein_g: proteinG ?? 0,
-        carbs_g: carbsG ?? 0,
-        fat_g: fatG ?? 0,
+        food_name: nutritionResolution.food_name || foodName,
+        quantity: nutritionResolution.quantity ?? quantity ?? 1,
+        serving_unit: nutritionResolution.serving_unit ?? servingUnit ?? null,
+        calories: nutritionResolution.calories,
+        protein_g: nutritionResolution.protein_g,
+        carbs_g: nutritionResolution.carbs_g,
+        fat_g: nutritionResolution.fat_g,
         logged_via: loggedVia || 'manual',
-        food_id: foodId ?? null,
+        food_id: nutritionResolution.food_id ?? null,
+        custom_food_id: nutritionResolution.custom_food_id ?? null,
+        packaged_food_id: nutritionResolution.packaged_food_id ?? null,
       })
       .select()
       .single();
@@ -4250,7 +4285,12 @@ app.post('/api/food-logs', auth, async (req, res) => {
       console.error('Diet XP processing error (non-fatal):', xpErr.message);
     }
 
-    res.json({ ...data, xpResult });
+    res.json({
+      ...data,
+      xpResult,
+      portion_scaling: nutritionResolution.portion_scaling,
+      nutrition_resolution: nutritionResolution,
+    });
   } catch (err) {
     console.error('log food error:', err);
     res.status(500).json({ message: err.message || 'Failed to log food' });
@@ -4373,25 +4413,33 @@ Be generous with common sense. If someone says 'lunch mein dal chawal khaya' ass
     if (!Array.isArray(items)) throw new Error('Gemini did not return a JSON array');
 
     const today = new Date().toISOString().slice(0, 10);
-    const rows = items.map((it) => ({
+    const resolvedItems = await resolveFoodItemsWithSupabase(
+      supabase,
+      items.map(item => ({ ...item, user_id: userId }))
+    );
+    const rows = resolvedItems.map((resolved) => ({
       user_id: userId,
       log_date: today,
       meal_type: mealType,
-      food_name: it.food_name,
-      quantity: it.quantity ?? 1,
-      serving_unit: it.serving_unit ?? null,
-      calories: it.calories ?? 0,
-      protein_g: it.protein_g ?? 0,
-      carbs_g: it.carbs_g ?? 0,
-      fat_g: it.fat_g ?? 0,
+      food_name: resolved.food_name,
+      quantity: resolved.quantity ?? 1,
+      serving_unit: resolved.serving_unit ?? null,
+      calories: resolved.calories ?? 0,
+      protein_g: resolved.protein_g ?? 0,
+      carbs_g: resolved.carbs_g ?? 0,
+      fat_g: resolved.fat_g ?? 0,
       logged_via: 'voice',
+      food_id: resolved.food_id ?? null,
     }));
 
     if (rows.length === 0) return res.json([]);
 
     const { data, error } = await supabase.from('food_logs').insert(rows).select();
     if (error) throw error;
-    res.json(data);
+    res.json(data.map((row, i) => ({
+      ...row,
+      nutrition_resolution: resolvedItems[i],
+    })));
   } catch (err) {
     console.error('voice food log error:', err);
     res.status(500).json({ message: err.message || 'Failed to log food via voice' });
@@ -4438,18 +4486,23 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
     if (!Array.isArray(items)) throw new Error('Gemini did not return a JSON array');
 
     const today = new Date().toISOString().slice(0, 10);
-    const rows = items.map((it) => ({
+    const resolvedItems = await resolveFoodItemsWithSupabase(
+      supabase,
+      items.map(item => ({ ...item, user_id: userId }))
+    );
+    const rows = resolvedItems.map((resolved) => ({
       user_id: userId,
       log_date: today,
       meal_type: mealType,
-      food_name: it.food_name,
-      quantity: it.quantity ?? 1,
-      serving_unit: it.serving_unit ?? null,
-      calories: it.calories ?? 0,
-      protein_g: it.protein_g ?? 0,
-      carbs_g: it.carbs_g ?? 0,
-      fat_g: it.fat_g ?? 0,
+      food_name: resolved.food_name,
+      quantity: resolved.quantity ?? 1,
+      serving_unit: resolved.serving_unit ?? null,
+      calories: resolved.calories ?? 0,
+      protein_g: resolved.protein_g ?? 0,
+      carbs_g: resolved.carbs_g ?? 0,
+      fat_g: resolved.fat_g ?? 0,
       logged_via: 'camera',
+      food_id: resolved.food_id ?? null,
     }));
 
     if (rows.length === 0) return res.json([]);
@@ -4460,6 +4513,7 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
     const withConfidence = data.map((row, i) => ({
       ...row,
       confidence: items[i]?.confidence ?? 'medium',
+      nutrition_resolution: resolvedItems[i],
     }));
     res.json(withConfidence);
   } catch (err) {
@@ -4472,7 +4526,26 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
 app.post('/api/diet-plan/generate', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { dietType = 'non_veg', cuisinePref = 'north_indian' } = req.body;
+    const requestedUserIds = [req.body?.userId, req.body?.user_id].filter(Boolean);
+    if (requestedUserIds.some(requestedUserId => requestedUserId !== userId)) {
+      return res.status(403).json({ message: 'Cannot generate a diet plan for another user' });
+    }
+
+    const parsed = dietPlanGenerateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      const message = parsed.error.issues
+        .map(e => `${e.path.join('.') || 'body'}: ${e.message}`)
+        .join('; ');
+      return res.status(400).json({ message });
+    }
+
+    const {
+      dietType = 'non_veg',
+      cuisinePref = 'north_indian',
+      preferences,
+      dietaryPreferences,
+    } = parsed.data;
+    const sanitizedPreferences = sanitizeOptionalPreference(preferences ?? dietaryPreferences);
 
     const { data: existing } = await supabase
       .from('user_macros')
@@ -4481,12 +4554,20 @@ app.post('/api/diet-plan/generate', auth, async (req, res) => {
       .maybeSingle();
     const macros = existing || await computeMacrosForUser(userId);
 
+    const { data: userProfile } = await supabase
+      .from('users')
+      .select('goal, activity_level, gender')
+      .eq('id', userId)
+      .maybeSingle();
+
     const system = `You are a nutrition coach building a structured Indian diet plan for a fitness app. Output ONLY valid JSON, no prose, no markdown fences.`;
 
     const user = `Generate a 7-day Indian diet plan. Requirements:
 - Daily target: ${macros.calories} calories, ${macros.protein_g}g protein, ${macros.carbs_g}g carbs, ${macros.fat_g}g fat
+- Stored user profile: goal=${userProfile?.goal || 'not specified'}, activity_level=${userProfile?.activity_level || macros.activity_level || 'moderate'}, gender=${userProfile?.gender || 'not specified'}
 - Diet type: ${dietType}
 - Cuisine: ${cuisinePref}
+${sanitizedPreferences ? `- Optional user preferences/restrictions: ${sanitizedPreferences}` : ''}
 - Budget-friendly, realistic Indian meals
 - Use familiar Indian household portions for "quantity" on every item — roti/paratha count (e.g. "2 pieces"), katori for dal/sabzi/curd (e.g. "1 katori"), plate/bowl for rice or poha (e.g. "1 plate"), glass/cup for milk/lassi/chai (e.g. "1 glass"), tbsp for ghee/oil/chutney. Do NOT use generic units like "100g" or "1 serving" — always use the Indian household unit a home cook would actually use.
 - Include 4 meals per day: breakfast, lunch, snack, dinner
@@ -5194,6 +5275,9 @@ app.use('/api/xp', xpRoutes);
 const supplementRoutes = require('./routes/supplementRoutes');
 app.use('/api/supplements', supplementRoutes);
 
+app.use('/api/custom-foods', require('./routes/customFoodRoutes'));
+app.use('/api/saved-meals', require('./routes/savedMealRoutes'));
+
 const expenseRoutes = require('./routes/expenseRoutes');
 app.use('/api/expenses', expenseRoutes);
 
@@ -5215,12 +5299,16 @@ app.use('/api/reports', reportsRoutes);
 const dietPlanRoutes = require('./routes/dietPlanRoutes');
 app.use('/api/diet-plans', dietPlanRoutes);
 
+app.use('/api/plans', require('./routes/plansRoutes'));
+
 app.use('/api/equipment', require('./routes/equipmentRoutes'));
 
 app.use('/api/chat', require('./routes/chatRoutes'));
+app.use('/api/friends', require('./routes/friendRoutes'));
 
 app.use('/api/trainer-earnings', require('./routes/trainerEarningsRoutes'));
-app.use('/api/friends', require('./routes/friendRoutes'));
+
+app.use('/api/staff-earnings', require('./routes/staffEarningsRoutes'));
 
 app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 
@@ -5230,8 +5318,11 @@ app.use('/api/client-diet-plans', require('./routes/clientDietPlanRoutes'));
 
 app.use('/api/member-imports', require('./routes/memberImportRoutes'));
 
+app.use('/api/assistant', require('./routes/assistantRoutes'));
+
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');
+const { initAssistantCrons } = require('./src/services/assistantCron');
 
 // Global error handler — catches any next(err) from middleware or async routes
 app.use((err, req, res, next) => {
@@ -5253,6 +5344,7 @@ app.listen(PORT, () => {
   initXPCrons();
   console.log('XP cron jobs initialized');
   initLockerCrons();
+  initAssistantCrons();
 
   console.log('Diet redesign routes registered:');
   console.log('  POST   /api/macros/calculate');
