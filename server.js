@@ -44,7 +44,10 @@ const allowedOrigins = [
 // doesn't weaken protection against actual cross-origin abuse from
 // attacker-controlled domains; it only ever helps a developer's own
 // machine. Every other origin still goes through the strict allowlist.
-const localhostOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+// Capacitor's default androidScheme is 'https' (not 'capacitor:', which is
+// iOS's scheme), so the Android WebView sends Origin: https://localhost —
+// hence http and https are both matched here.
+const localhostOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
 app.use(cors({
   origin: (origin, callback) => {
