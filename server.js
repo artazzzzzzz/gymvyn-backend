@@ -5265,6 +5265,8 @@ app.use('/api/staff-earnings', require('./routes/staffEarningsRoutes'));
 
 app.use('/api/class-bookings', require('./routes/classBookingRoutes'));
 
+app.use('/api/device-tokens', require('./routes/deviceTokenRoutes'));
+
 app.use('/api/ai', require('./src/routes/ai'));
 
 app.use('/api/client-diet-plans', require('./routes/clientDietPlanRoutes'));

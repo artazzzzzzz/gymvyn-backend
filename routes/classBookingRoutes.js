@@ -1,6 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
+const { sendPushToUser } = require('../src/services/notificationService');
 
 const router = express.Router();
 
@@ -20,7 +21,7 @@ router.post('/:classId', auth, async (req, res) => {
     // Verify class exists and is active
     const { data: cls, error: clsErr } = await supabase
       .from('class_schedule')
-      .select('id, gym_id, capacity, is_active')
+      .select('id, gym_id, capacity, is_active, class_name')
       .eq('id', classId)
       .maybeSingle();
     if (clsErr) throw clsErr;
@@ -68,10 +69,21 @@ router.post('/:classId', auth, async (req, res) => {
       throw insertErr;
     }
 
-    return res.status(201).json({
+    res.status(201).json({
       status: booking.status,
       ...(booking.waitlist_position != null && { waitlist_position: booking.waitlist_position }),
     });
+
+    // Fire-and-forget — only for an immediate confirmed booking. A
+    // waitlisted user already sees their status in the response above;
+    // they get a push later if/when promoted (see the DELETE handler).
+    if (status === 'booked') {
+      sendPushToUser(supabase, userId, {
+        title: 'Booking confirmed',
+        body: cls.class_name ? `You're booked for ${cls.class_name}.` : "You're booked for your class.",
+        data: { type: 'class_booking_confirmed', classId },
+      }).catch(err => console.error('[classBookingRoutes] push dispatch failed:', err.message));
+    }
   } catch (err) {
     console.error('POST /api/class-bookings/:classId error:', err);
     res.status(500).json({ error: err.message || 'Failed to book class' });
@@ -179,10 +191,25 @@ router.delete('/:classId', auth, async (req, res) => {
       }
     }
 
-    return res.json({
+    res.json({
       cancelled: true,
       ...(promotedUserId && { promoted_user_id: promotedUserId }),
     });
+
+    // Fire-and-forget
+    if (promotedUserId) {
+      const { data: cls } = await supabase
+        .from('class_schedule')
+        .select('class_name')
+        .eq('id', classId)
+        .maybeSingle();
+
+      sendPushToUser(supabase, promotedUserId, {
+        title: "You're off the waitlist!",
+        body: cls?.class_name ? `A spot opened up — you're now booked for ${cls.class_name}.` : "A spot opened up — you're now booked.",
+        data: { type: 'class_booking_promoted', classId },
+      }).catch(err => console.error('[classBookingRoutes] push dispatch failed:', err.message));
+    }
   } catch (err) {
     console.error('DELETE /api/class-bookings/:classId error:', err);
     res.status(500).json({ error: err.message || 'Failed to cancel booking' });

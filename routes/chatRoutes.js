@@ -3,6 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { canMessage, getOrCreateConversationIfAllowed, getGymContexts, sharedGymId } = require('../src/utils/canMessage');
 const { auth } = require('../middleware/auth');
 const { validateMessageContent, sendMessageAtomically, markConversationRead } = require('../src/services/chatService');
+const { sendPushToUser } = require('../src/services/notificationService');
 
 const router = express.Router();
 
@@ -162,6 +163,14 @@ router.post('/message', auth, async (req, res) => {
     msg.sender = sender || null;
 
     res.json(msg);
+
+    // Fire-and-forget — a push failure must never affect the chat response
+    // already sent above.
+    sendPushToUser(supabase, otherId, {
+      title: sender?.full_name || 'New message',
+      body: validContent.value,
+      data: { type: 'chat_message', conversationId },
+    }).catch(err => console.error('[chatRoutes] push dispatch failed:', err.message));
   } catch (err) {
     console.error('POST /api/chat/message error:', err);
     res.status(500).json({ error: err.message });
