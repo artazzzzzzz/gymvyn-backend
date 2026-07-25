@@ -38,4 +38,69 @@ async function callDeepSeek({ system, user, responseFormat }) {
   };
 }
 
-module.exports = { getClient, callDeepSeek };
+// Tool-calling loop for the owner assistant.
+// toolExecutor(toolCalls) => { toolResults: [{tool_call_id, result}], earlyReturn: proposedAction|null }
+// Returns earlyReturn immediately without appending tool results to the loop,
+// so the model never learns which action tool was selected (security).
+async function callDeepSeekWithTools({ messages, tools, toolExecutor, maxRounds = 8 }) {
+  const client = getClient();
+  let current = [...messages];
+  let totalInput = 0;
+  let totalOutput = 0;
+
+  for (let round = 0; round < maxRounds; round++) {
+    let response;
+    try {
+      response = await client.chat.completions.create({
+        model: 'deepseek-chat',
+        messages: current,
+        tools,
+        tool_choice: 'auto',
+      });
+    } catch (err) {
+      throw new Error(`DeepSeek error: ${err.message}`);
+    }
+
+    totalInput += response.usage?.prompt_tokens || 0;
+    totalOutput += response.usage?.completion_tokens || 0;
+
+    const choice = response.choices[0];
+    const msg = choice.message;
+
+    if (!msg.tool_calls?.length) {
+      return {
+        text: msg.content,
+        usage: { inputTokens: totalInput, outputTokens: totalOutput },
+        proposedAction: null,
+      };
+    }
+
+    const { toolResults, earlyReturn } = await toolExecutor(msg.tool_calls);
+
+    if (earlyReturn) {
+      return {
+        text: null,
+        usage: { inputTokens: totalInput, outputTokens: totalOutput },
+        proposedAction: earlyReturn,
+      };
+    }
+
+    // Append assistant turn then tool results
+    current.push(msg);
+    for (const tr of toolResults) {
+      current.push({
+        role: 'tool',
+        tool_call_id: tr.tool_call_id,
+        content: typeof tr.result === 'string' ? tr.result : JSON.stringify(tr.result),
+      });
+    }
+  }
+
+  return {
+    text: 'I reached my analysis limit. Please ask a more specific question.',
+    usage: { inputTokens: totalInput, outputTokens: totalOutput },
+    proposedAction: null,
+  };
+}
+
+module.exports = { getClient, callDeepSeek, callDeepSeekWithTools };

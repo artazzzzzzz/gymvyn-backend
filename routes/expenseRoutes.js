@@ -1,5 +1,8 @@
 const express = require('express');
+const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
+const { auth } = require('../middleware/auth');
+const { validate } = require('../src/utils/validate');
 
 const router = express.Router();
 
@@ -13,19 +16,23 @@ const VALID_CATEGORIES = [
   'marketing', 'maintenance', 'other',
 ];
 
+const categoryMessage = `category must be one of: ${VALID_CATEGORIES.join(', ')}`;
+
+const expenseCreateSchema = z.object({
+  category: z.enum(VALID_CATEGORIES, { error: categoryMessage }),
+  description: z.string().trim().optional().nullable(),
+  amount: z.number({ error: 'amount must be a number' }).positive('amount must be a positive number'),
+  expense_date: z.string().optional().nullable(),
+});
+
+const expenseUpdateSchema = z.object({
+  category: z.enum(VALID_CATEGORIES, { error: categoryMessage }).optional(),
+  description: z.string().trim().optional().nullable(),
+  amount: z.number({ error: 'amount must be a number' }).positive('amount must be a positive number').optional(),
+  expense_date: z.string().optional().nullable(),
+}).refine((d) => Object.keys(d).length > 0, { message: 'No valid fields to update' });
+
 // ── Middleware ────────────────────────────────────────────────────────────────
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
 
 async function withProfile(req, res, next) {
   const { data, error } = await supabase
@@ -209,26 +216,18 @@ router.get(
 
 router.post(
   '/',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly, validate(expenseCreateSchema),
   async (req, res) => {
     try {
       const { category, description, amount, expense_date } = req.body;
-
-      if (!category || !VALID_CATEGORIES.includes(category)) {
-        return res.status(400).json({ error: `category must be one of: ${VALID_CATEGORIES.join(', ')}` });
-      }
-      const amt = Number(amount);
-      if (!Number.isFinite(amt) || amt <= 0) {
-        return res.status(400).json({ error: 'amount must be a positive number' });
-      }
 
       const { data, error } = await supabase
         .from('gym_expenses')
         .insert({
           gym_id:       req.gymId,
           category,
-          description:  description?.trim() || null,
-          amount:       amt,
+          description:  description || null,
+          amount,
           expense_date: expense_date || todayISO(),
         })
         .select()
@@ -247,7 +246,7 @@ router.post(
 
 router.patch(
   '/:id',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly, validate(expenseUpdateSchema),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -263,27 +262,8 @@ router.patch(
       if (fetchErr) throw fetchErr;
       if (!existing) return res.status(404).json({ error: 'Expense not found in your gym' });
 
-      const updates = {};
-
-      if (req.body.category !== undefined) {
-        if (!VALID_CATEGORIES.includes(req.body.category)) {
-          return res.status(400).json({ error: `category must be one of: ${VALID_CATEGORIES.join(', ')}` });
-        }
-        updates.category = req.body.category;
-      }
-      if (req.body.amount !== undefined) {
-        const amt = Number(req.body.amount);
-        if (!Number.isFinite(amt) || amt <= 0) {
-          return res.status(400).json({ error: 'amount must be a positive number' });
-        }
-        updates.amount = amt;
-      }
-      if (req.body.description !== undefined) updates.description = req.body.description?.trim() || null;
-      if (req.body.expense_date !== undefined) updates.expense_date = req.body.expense_date;
-
-      if (Object.keys(updates).length === 0) {
-        return res.status(400).json({ error: 'No valid fields to update' });
-      }
+      const updates = { ...req.body };
+      if (updates.description !== undefined) updates.description = updates.description || null;
 
       const { data, error } = await supabase
         .from('gym_expenses')

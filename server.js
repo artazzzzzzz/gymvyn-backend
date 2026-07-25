@@ -11,6 +11,8 @@ const cron = require('node-cron');
 const ml = require('./ml_client');
 const QRCode = require('qrcode');
 const { auth, requireGymOwner } = require('./middleware/auth');
+const { deleteUserCascade } = require('./src/utils/userDeletion');
+const { validate } = require('./src/utils/validate');
 const { rateLimit } = require('express-rate-limit');
 const { z } = require('zod');
 const {
@@ -31,6 +33,7 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:3000',
+  'capacitor://localhost',
 ];
 
 // Vite's autoPort means the local dev server can land on any port (5173,
@@ -41,7 +44,7 @@ const allowedOrigins = [
 // doesn't weaken protection against actual cross-origin abuse from
 // attacker-controlled domains; it only ever helps a developer's own
 // machine. Every other origin still goes through the strict allowlist.
-const localhostOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
+const localhostOriginPattern = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -80,33 +83,29 @@ const authLimiter = rateLimit({
 app.use(globalLimiter);
 
 // ── Input validation helper ───────────────────────────────────────────────────
-
-function validate(schema) {
-  return (req, res, next) => {
-    const result = schema.safeParse(req.body);
-    if (!result.success) {
-      const message = result.error.issues
-        .map(e => `${e.path.join('.') || 'body'}: ${e.message}`)
-        .join('; ');
-      return res.status(400).json({ error: 'Validation failed', message });
-    }
-    req.body = result.data;
-    next();
-  };
-}
+// (validate() itself now lives in ./src/utils/validate.js, imported above,
+// so route modules outside this file can reuse it too.)
 
 // Membership-plan schemas — price capped at ₹10,00,000, duration at 10 years.
 const membershipPlanCreateSchema = z.object({
   name:         z.string().trim().min(1, 'name is required'),
-  duration_days: z.number({ invalid_type_error: 'duration_days must be a number' })
+  duration_days: z.number({ error: 'duration_days must be a number' })
                   .int('duration_days must be an integer')
                   .positive('duration_days must be positive')
                   .max(3650, 'duration_days cannot exceed 3650'),
-  price:        z.number({ invalid_type_error: 'price must be a number' })
+  price:        z.number({ error: 'price must be a number' })
                  .positive('price must be a positive number')
                  .max(1_000_000, 'price exceeds maximum allowed value'),
   features:     z.array(z.string()).optional().default([]),
   is_active:    z.boolean().optional().default(true),
+});
+
+const membershipRenewSchema = z.object({
+  plan_type:    z.string().trim().optional().nullable(),
+  amount:       z.number({ error: 'amount must be a number' })
+                 .positive('amount must be a positive number')
+                 .max(1_000_000, 'amount exceeds maximum allowed value'),
+  new_end_date: z.string().min(1, 'new_end_date is required'),
 });
 
 // .strict() blocks unknown keys — the PATCH handler spreads req.body directly
@@ -1523,16 +1522,10 @@ app.get('/api/gym-members/:memberId', auth, async (req, res) => {
 
 // ── POST /api/gym-members/:memberId/renew ─────────────────────────────────────
 
-app.post('/api/gym-members/:memberId/renew', auth, async (req, res) => {
+app.post('/api/gym-members/:memberId/renew', validate(membershipRenewSchema), auth, async (req, res) => {
   try {
     const { memberId } = req.params;
-    const { plan_type, amount, new_end_date } = req.body || {};
-
-    if (!new_end_date) return res.status(400).json({ error: 'new_end_date is required' });
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number' });
-    }
+    const { plan_type, amount, new_end_date } = req.body;
 
     // Resolve gymId from existing membership
     const { data: memRow, error: memLookupErr } = await supabase
@@ -1577,7 +1570,7 @@ app.post('/api/gym-members/:memberId/renew', auth, async (req, res) => {
         gym_id:        gymId,
         user_id:       memberId,
         membership_id: memRow.id,
-        amount:        amt,
+        amount,
         due_date:      new_end_date,
         paid_at:       now,
         status:        'paid',
@@ -5203,53 +5196,7 @@ app.delete('/api/users/:userId', auth, async (req, res) => {
       return res.status(403).json({ message: 'Forbidden' });
     }
 
-    // Delete workout_set_logs first (FK child of workout_logs)
-    const { data: workoutLogs } = await supabase
-      .from('workout_logs')
-      .select('id')
-      .eq('user_id', userId);
-    const logIds = (workoutLogs || []).map(r => r.id);
-    if (logIds.length) {
-      const { error: e } = await supabase.from('workout_set_logs').delete().in('workout_log_id', logIds);
-      if (e) throw e;
-    }
-
-    const deletes = [
-      supabase.from('workout_logs').delete().eq('user_id', userId),
-      supabase.from('food_logs').delete().eq('user_id', userId),
-      supabase.from('progress_entries').delete().eq('user_id', userId),
-      supabase.from('xp_events').delete().eq('user_id', userId),
-      supabase.from('user_xp').delete().eq('user_id', userId),
-      supabase.from('ai_requests').delete().eq('user_id', userId),
-      supabase.from('assigned_plans').delete().eq('client_id', userId),
-      supabase.from('user_workout_plans').delete().eq('user_id', userId),
-      supabase.from('exercise_bookmarks').delete().eq('user_id', userId),
-      supabase.from('personal_records').delete().eq('user_id', userId),
-      supabase.from('user_macros').delete().eq('user_id', userId),
-      supabase.from('messages').delete().eq('sender_id', userId),
-    ];
-    const results = await Promise.all(deletes);
-    for (const { error: e } of results) { if (e) throw e; }
-
-    // Sequential: conversations and trainer_clients may share FKs
-    const { error: convErr } = await supabase
-      .from('conversations')
-      .delete()
-      .or(`participant_1_id.eq.${userId},participant_2_id.eq.${userId}`);
-    if (convErr) throw convErr;
-
-    const { error: tcErr } = await supabase
-      .from('trainer_clients')
-      .delete()
-      .or(`client_id.eq.${userId},trainer_id.eq.${userId}`);
-    if (tcErr) throw tcErr;
-
-    const { error: userErr } = await supabase.from('users').delete().eq('id', userId);
-    if (userErr) throw userErr;
-
-    // Hard-delete the Supabase auth account
-    const { error: deleteErr } = await supabase.auth.admin.deleteUser(userId);
-    if (deleteErr) throw deleteErr;
+    await deleteUserCascade(supabase, userId);
 
     res.json({ success: true });
   } catch (err) {
@@ -5298,6 +5245,9 @@ app.use('/api/reports', reportsRoutes);
 
 const dietPlanRoutes = require('./routes/dietPlanRoutes');
 app.use('/api/diet-plans', dietPlanRoutes);
+app.use('/api/nutrition', require('./routes/nutritionRoutes'));
+
+app.use('/api/trainer/diet-plans', require('./routes/trainerDietPlanFoodRoutes'));
 
 app.use('/api/plans', require('./routes/plansRoutes'));
 
@@ -5320,6 +5270,8 @@ app.use('/api/member-imports', require('./routes/memberImportRoutes'));
 
 app.use('/api/assistant', require('./routes/assistantRoutes'));
 
+app.use('/api/admin', require('./routes/adminRoutes'));
+
 const { initXPCrons } = require('./src/services/xpCron');
 const { initLockerCrons } = require('./src/services/lockerCron');
 const { initAssistantCrons } = require('./src/services/assistantCron');
@@ -5340,7 +5292,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`FitForge backend running on http://localhost:${PORT}`);
+  console.log(`Gymvyn backend running on http://localhost:${PORT}`);
   initXPCrons();
   console.log('XP cron jobs initialized');
   initLockerCrons();

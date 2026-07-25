@@ -12,7 +12,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const DB_PATH = path.resolve(__dirname, '../../fitforge-frontend/src/data/exerciseDatabase.js');
+const DB_PATH = path.resolve(__dirname, '../../gymvyn-frontend/src/data/exerciseDatabase.js');
 
 // ── Step 1: Query keep list from Supabase ─────────────────────────────────────
 
@@ -96,7 +96,7 @@ function checkBreakage(removedNames) {
   fs.writeFileSync(tempFile, removedNames.join('\n') + '\n');
 
   const { execSync } = require('child_process');
-  const srcDir = path.resolve(__dirname, '../../fitforge-frontend/src');
+  const srcDir = path.resolve(__dirname, '../../gymvyn-frontend/src');
 
   let hits = '';
   try {

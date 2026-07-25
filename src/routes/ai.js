@@ -8,6 +8,7 @@ const { parseVoiceDietLog } = require('../ai/features/voiceDiet');
 const { parseFoodPhotos } = require('../ai/features/foodVision');
 const { parseVoiceWorkoutLog } = require('../ai/features/voiceWorkout');
 const { generateDietPlan } = require('../ai/features/dietPlanGeneration');
+const { resolveFoodItemsWithSupabase } = require('../../utils/foodNutritionResolver');
 
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -49,10 +50,6 @@ router.post(
   aiRateLimit,
   audioUpload.single('audio'),
   async (req, res) => {
-    console.log('=== VOICE DIET HANDLER REACHED ===');
-    console.log('file:', req.file?.size, req.file?.mimetype);
-    console.log('user:', req.userId);
-
     if (!req.file) {
       return res.status(400).json({ error: 'MISSING_AUDIO', message: 'No audio file uploaded.' });
     }
@@ -117,17 +114,22 @@ router.post('/voice/diet/save', auth, async (req, res) => {
     const ist = new Date(Date.now() + (5 * 60 + 30) * 60 * 1000);
     return ist.toISOString().split('T')[0];
   })();
-  const rows = items.map(item => ({
+  const resolvedItems = await resolveFoodItemsWithSupabase(
+    supabase,
+    items.map(item => ({ ...item, user_id: req.userId }))
+  );
+  const rows = resolvedItems.map((resolved) => ({
     user_id:   req.userId,
     log_date:  today,
     meal_type,
-    food_name: item.food_name,
-    calories:  item.calories,
-    protein_g: item.protein_g,
-    carbs_g:   item.carbs_g,
-    fat_g:     item.fat_g,
-    quantity:  item.quantity,
-    serving_unit: item.unit,
+    food_name: resolved.food_name,
+    calories:  resolved.calories,
+    protein_g: resolved.protein_g,
+    carbs_g:   resolved.carbs_g,
+    fat_g:     resolved.fat_g,
+    quantity:  resolved.quantity,
+    serving_unit: resolved.serving_unit,
+    food_id: resolved.food_id ?? null,
     logged_via: diet_plan_id ? 'plan' : 'voice',
     ...(diet_plan_id ? { diet_plan_id, plan_day, plan_item_index } : {}),
   }));
@@ -138,7 +140,11 @@ router.post('/voice/diet/save', auth, async (req, res) => {
     return res.status(500).json({ error: 'SAVE_FAILED', message: error.message });
   }
 
-  return res.json({ saved_count: data.length, food_log_ids: data.map(r => r.id) });
+  return res.json({
+    saved_count: data.length,
+    food_log_ids: data.map(r => r.id),
+    nutrition_resolution: resolvedItems,
+  });
 });
 
 // ── POST /api/ai/voice/workout ────────────────────────────────────────────────

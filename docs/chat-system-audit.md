@@ -1,5 +1,9 @@
 # Gymvyn chat-system architecture and code audit
 
+> Historical note: Gymvyn Plans Phase 0 removed marketplace purchases as a
+> messaging eligibility path. Marketplace findings below describe the legacy
+> implementation and must not be read as current behavior.
+
 **Audit date:** 2026-07-17
 **Scope:** `/Users/artazayaz/Desktop/gymvyn-backend` and sibling `/Users/artazayaz/Desktop/gymvyn-frontend`, source and versioned migrations only. No production data, migrations, deploys, or application code were changed.
 

@@ -15,7 +15,7 @@
     "test:chat-db": "node scripts/run-chat-security-local-tests.js",
     "test:chat-security": "node --test tests/chatSecurity.test.js",
     "test:plans-local-e2e": "GYMVYN_PLANS_E2E_LOCAL_ONLY=true node scripts/run-plans-local-e2e.js",
-    "test": "node --test tests/auth.test.js tests/trainerRoutesAuth.test.js tests/memberImportService.test.js tests/authUserCache.test.js tests/dietPlanAuth.test.js tests/foodNutritionResolver.test.js tests/foodPortionScaling.test.js tests/foodSearchRanking.test.js tests/packagedFood.test.js tests/chatSecurity.test.js tests/chatDatabase.integration.test.js tests/friendRoutes.test.js"
+    "test": "node --test tests/auth.test.js tests/adminRoutesAuth.test.js tests/userDeletionCascade.test.js tests/trainerRoutesAuth.test.js tests/plansAdminAuth.test.js tests/plansRoutes.test.js tests/memberImportService.test.js tests/authUserCache.test.js tests/dietPlanAuth.test.js tests/foodNutritionResolver.test.js tests/foodPortionScaling.test.js tests/foodSearchRanking.test.js tests/packagedFood.test.js tests/chatSecurity.test.js tests/chatDatabase.integration.test.js tests/friendRoutes.test.js"
   },
   "keywords": [],
   "author": "",
@@ -39,6 +39,7 @@
     "openai": "^6.45.0",
     "pdfkit": "^0.19.1",
     "qrcode": "^1.5.4",
+    "razorpay": "^2.9.8",
     "sharp": "^0.35.2",
     "zod": "^4.4.3"
   }

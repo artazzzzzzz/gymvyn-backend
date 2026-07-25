@@ -1,5 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const { deactivateOtherGymMemberships } = require('../src/utils/relationshipAuth');
+const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -7,18 +9,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
 
 // GET /api/gym/join-code — gym owner gets their gym's join code
 router.get('/join-code', auth, async (req, res) => {
@@ -101,6 +91,8 @@ router.post('/join', auth, async (req, res) => {
       .limit(1)
       .maybeSingle();
     if (memLookupErr) throw memLookupErr;
+
+    await deactivateOtherGymMemberships(supabase, req.user.id, gym.id);
 
     if (!existingMembership) {
       const { error: memErr } = await supabase

@@ -6,3 +6,4 @@ scripts/test-results-api.md
 .code-review-graph/
 .env.local
 .env
+.env.chat-test.local

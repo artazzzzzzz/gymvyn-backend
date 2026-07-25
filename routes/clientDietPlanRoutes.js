@@ -1,5 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const { getActiveTrainerClientLink } = require('../src/utils/relationshipAuth');
+const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -8,29 +10,26 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
-
 // PATCH /api/client-diet-plans/:planId — trainer edits a generated plan
 router.patch('/:planId', auth, async (req, res) => {
   try {
     const { data: existing, error: fetchErr } = await supabase
       .from('client_diet_plans')
-      .select('id, trainer_id')
+      .select('id, trainer_id, client_user_id')
       .eq('id', req.params.planId)
       .maybeSingle();
     if (fetchErr) throw fetchErr;
     if (!existing || existing.trainer_id !== req.user.id) {
       return res.status(404).json({ error: 'Not found' });
+    }
+
+    const activeLink = await getActiveTrainerClientLink(
+      supabase,
+      req.user.id,
+      existing.client_user_id
+    );
+    if (!activeLink) {
+      return res.status(403).json({ error: 'NOT_AUTHORIZED', message: 'You are not linked to this client.' });
     }
 
     const { name, description, plan_data, is_active } = req.body;

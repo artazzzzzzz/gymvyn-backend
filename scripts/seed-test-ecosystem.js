@@ -18,6 +18,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { canonicalPair } = require('../src/utils/canMessage');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -553,21 +554,30 @@ async function main() {
   }
 
   // 5 conversations: 3 with clients + 2 with members
+  //
+  // conversations is keyed by a canonical (participant_1_id, participant_2_id)
+  // pair, not trainer_id/client_id -- it was generalized to a two-participant
+  // model for the friends/chat rework (see src/utils/canMessage.js). Creation
+  // and message insertion both go through the same SECURITY DEFINER RPCs the
+  // app itself uses (chat_get_or_create_conversation, chat_send_message,
+  // migrations/chat_security_phase1_additive.sql) instead of hand-writing
+  // participant ordering and last_message_* bookkeeping here, so seeded rows
+  // can't drift out of sync with those triggers' behavior again.
   const chatPartners = ['client_1', 'client_2', 'client_3', 'member_1', 'member_2'];
   for (const ck of chatPartners) {
     if (!ids.trainer_1 || !ids[ck]) continue;
+    const [p1, p2] = canonicalPair(ids.trainer_1, ids[ck]);
     const { data: existing } = await supabase
       .from('conversations').select('id')
-      .eq('trainer_id', ids.trainer_1).eq('client_id', ids[ck]).maybeSingle();
+      .eq('participant_1_id', p1).eq('participant_2_id', p2).maybeSingle();
     let convId = existing?.id;
-    if (!convId && !VERIFY_ONLY) {
-      const { data: c, error } = await supabase.from('conversations').insert({
-        trainer_id: ids.trainer_1, client_id: ids[ck],
-        last_message_preview: 'TEST_FF hello',
-        last_message_at: isoStr(today),
-      }).select('id').single();
+    if (!convId) {
+      if (VERIFY_ONLY) { console.log(`  ✗ missing conversation trainer_1↔${ck}`); continue; }
+      const { data: newConvId, error } = await supabase.rpc('chat_get_or_create_conversation', {
+        user_a: ids.trainer_1, user_b: ids[ck],
+      });
       if (error) throw new Error(`conversations: ${error.message}`);
-      convId = c.id;
+      convId = newConvId;
       console.log(`  + created conversation trainer_1↔${ck}`);
     } else {
       console.log(`  · exists  conversation trainer_1↔${ck}`);
@@ -576,10 +586,14 @@ async function main() {
       const { count } = await supabase
         .from('messages').select('*', { count: 'exact', head: true }).eq('conversation_id', convId);
       if ((count || 0) < 2) {
-        await supabase.from('messages').insert([
-          { conversation_id: convId, sender_id: ids.trainer_1, content: 'TEST_FF hi from trainer' },
-          { conversation_id: convId, sender_id: ids[ck],       content: 'TEST_FF hi back' },
-        ]);
+        const { error: m1Err } = await supabase.rpc('chat_send_message', {
+          p_conversation_id: convId, p_sender_id: ids.trainer_1, p_content: 'TEST_FF hi from trainer',
+        });
+        if (m1Err) throw new Error(`chat_send_message: ${m1Err.message}`);
+        const { error: m2Err } = await supabase.rpc('chat_send_message', {
+          p_conversation_id: convId, p_sender_id: ids[ck], p_content: 'TEST_FF hi back',
+        });
+        if (m2Err) throw new Error(`chat_send_message: ${m2Err.message}`);
       }
     }
   }

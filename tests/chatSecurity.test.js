@@ -36,8 +36,8 @@ function relationshipSupabase(tables) {
             rows = rows.filter((row) => row.end_date == null || row.end_date >= today);
           }
           if (state.or?.includes('trainer_id.eq.')) {
-            const ids = [...state.or.matchAll(/(?:trainer_id|client_id|buyer_id|seller_id|sender_id|receiver_id)\.eq\.([^,\)]+)/g)].map((match) => match[1]);
-            rows = rows.filter((row) => ids.includes(row.trainer_id) || ids.includes(row.client_id) || ids.includes(row.buyer_id) || ids.includes(row.seller_id) || ids.includes(row.sender_id) || ids.includes(row.receiver_id));
+            const ids = [...state.or.matchAll(/(?:trainer_id|client_id|sender_id|receiver_id)\.eq\.([^,\)]+)/g)].map((match) => match[1]);
+            rows = rows.filter((row) => ids.includes(row.trainer_id) || ids.includes(row.client_id) || ids.includes(row.sender_id) || ids.includes(row.receiver_id));
           }
           resolve({ data: state.single ? rows[0] || null : rows, error: null });
         } catch (error) { if (reject) reject(error); }
@@ -73,7 +73,7 @@ const activeGymRelationships = {
     { user_id: 'trainer-paused', gym_id: 'gym-a', is_active: true, status: 'paused' },
     { user_id: 'trainer-off', gym_id: 'gym-off', is_active: true, status: 'active' },
   ],
-  trainer_clients: [], marketplace_purchases: [], buddy_requests: [], friendships: [], user_blocks: [],
+  trainer_clients: [], buddy_requests: [], friendships: [], user_blocks: [],
 };
 
 test('chat content validation rejects non-string, blank, and oversized content', () => {
@@ -106,6 +106,15 @@ test('canMessage permits accepted friends cross-gym but rejects pending friends'
   assert.equal(await canMessage(accepted, 'friend-a', 'friend-b'), true);
   assert.equal(await canMessage(accepted, 'friend-b', 'friend-a'), true);
   assert.equal(await canMessage(pending, 'friend-a', 'friend-b'), false);
+});
+
+test('canMessage denies a legacy marketplace buyer and seller with no retained relationship', async () => {
+  const db = relationshipSupabase({
+    ...activeGymRelationships,
+    marketplace_purchases: [{ buyer_id: 'legacy-buyer', seller_id: 'legacy-seller', status: 'delivered' }],
+  });
+  assert.equal(await canMessage(db, 'legacy-buyer', 'legacy-seller'), false);
+  assert.equal(await canMessage(db, 'legacy-seller', 'legacy-buyer'), false);
 });
 
 test('canMessage block override denies otherwise valid trainer, gym, and friend relationships', async () => {

@@ -12,7 +12,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const DB_PATH = path.resolve(__dirname, '../../fitforge-frontend/src/data/exerciseDatabase.js');
+const DB_PATH = path.resolve(__dirname, '../../gymvyn-frontend/src/data/exerciseDatabase.js');
 
 // The 6 names to REMOVE — batch-2 duplicates of the richer original-120 entries
 const TO_REMOVE = [

@@ -1,5 +1,8 @@
 const express = require('express');
+const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
+const { auth } = require('../middleware/auth');
+const { validate } = require('../src/utils/validate');
 
 const router = express.Router();
 
@@ -8,19 +11,18 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// price is required only when is_paid is true -- enforced with .refine()
+// since zod's per-field checks can't see a sibling field.
+const lockerCreateSchema = z.object({
+  label: z.string({ error: 'label is required' }).trim().min(1, 'label is required'),
+  is_paid: z.boolean({ error: 'is_paid must be a boolean' }),
+  price: z.number({ error: 'price must be a number' }).optional().nullable(),
+}).refine(
+  (d) => !d.is_paid || (typeof d.price === 'number' && Number.isFinite(d.price) && d.price > 0),
+  { message: 'price must be a positive number when is_paid is true', path: ['price'] }
+);
+
 // ── Middleware ────────────────────────────────────────────────────────────────
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
 
 async function withProfile(req, res, next) {
   const { data, error } = await supabase
@@ -238,43 +240,30 @@ router.get(
 // POST /api/lockers
 router.post(
   '/',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly, requireLockersEnabled, validate(lockerCreateSchema),
   async (req, res) => {
     try {
       const { label, is_paid, price } = req.body;
-
-      if (!label?.trim()) {
-        return res.status(400).json({ error: 'label is required' });
-      }
-      if (typeof is_paid !== 'boolean') {
-        return res.status(400).json({ error: 'is_paid must be a boolean' });
-      }
-      if (is_paid) {
-        const p = Number(price);
-        if (!Number.isFinite(p) || p <= 0) {
-          return res.status(400).json({ error: 'price must be a positive number when is_paid is true' });
-        }
-      }
 
       // Pre-flight uniqueness check for better error message
       const { data: existing } = await supabase
         .from('gym_lockers')
         .select('id')
         .eq('gym_id', req.gymId)
-        .eq('label', label.trim())
+        .eq('label', label)
         .maybeSingle();
 
       if (existing) {
-        return res.status(409).json({ error: `A locker with label "${label.trim()}" already exists in this gym` });
+        return res.status(409).json({ error: `A locker with label "${label}" already exists in this gym` });
       }
 
       const { data, error } = await supabase
         .from('gym_lockers')
         .insert({
           gym_id:  req.gymId,
-          label:   label.trim(),
+          label,
           is_paid,
-          price:   is_paid ? Number(price) : null,
+          price:   is_paid ? price : null,
           status:  'available',
         })
         .select()

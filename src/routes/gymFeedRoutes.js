@@ -1,5 +1,6 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const { auth: baseAuth } = require('../../middleware/auth');
 
 const router = express.Router();
 
@@ -8,25 +9,19 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Wraps the canonical auth middleware to additionally attach the caller's
+// role, which downstream handlers here use for post-type gating.
 async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
+  return baseAuth(req, res, async () => {
+    const { data: userRow } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    req.user.role = userRow?.role || 'consumer';
 
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-
-  // Attach role from users table
-  const { data: userRow } = await supabase
-    .from('users')
-    .select('role')
-    .eq('id', req.user.id)
-    .maybeSingle();
-  req.user.role = userRow?.role || 'consumer';
-
-  next();
+    next();
+  });
 }
 
 const VALID_POST_TYPES = ['announcement', 'achievement', 'tip', 'general'];

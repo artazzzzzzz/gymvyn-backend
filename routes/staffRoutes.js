@@ -12,6 +12,7 @@ const supabase = createClient(
 const PERMISSION_KEYS = [
   'checkin',
   'view_members',
+  'manage_members',
   'view_payments',
   'collect_payment',
   'view_schedule',

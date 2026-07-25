@@ -5,11 +5,6 @@
 //   member <-> their trainer            : trainer_clients, status='active'
 //   accepted friends                    : friendships, status='accepted'
 //   blocked users                       : user_blocks always deny before every allow
-//   buyer <-> seller of a marketplace    : marketplace_purchases,
-//     purchase                             status != 'cancelled' (deliberately
-//                                           cross-gym — the whole point of the
-//                                           marketplace is trainer/member pairs
-//                                           who share no other relationship)
 //   member <-> gym staff at their gym   : gym_memberships + gym_staff, same gym_id
 //   member <-> member, same gym         : gym_memberships (both) + buddy_requests
 //                                         accepted, same gym_id (opt-in)
@@ -101,19 +96,6 @@ async function isAcceptedFriend(supabase, userA, userB) {
   return (data || []).length > 0;
 }
 
-async function hasMarketplacePurchaseRelationship(supabase, userA, userB) {
-  const { data, error } = await supabase
-    .from('marketplace_purchases')
-    .select('id')
-    .neq('status', 'cancelled')
-    .or(
-      `and(buyer_id.eq.${userA},seller_id.eq.${userB}),and(buyer_id.eq.${userB},seller_id.eq.${userA})`
-    )
-    .limit(1);
-  if (error) throw error;
-  return (data || []).length > 0;
-}
-
 async function acceptedBuddyGymId(supabase, userA, userB) {
   const { data, error } = await supabase
     .from('buddy_requests')
@@ -195,17 +177,13 @@ async function canMessage(supabase, userA, userB) {
   if (!userA || !userB || userA === userB) return false;
 
   // A block is an absolute override over friends, gym, trainer-client,
-  // buddy, and marketplace relationships.
+  // and buddy relationships.
   if (await isBlocked(supabase, userA, userB)) return false;
 
   if (await isAcceptedFriend(supabase, userA, userB)) return true;
 
   // trainer <-> their client
   if (await isLinkedTrainerClient(supabase, userA, userB)) return true;
-
-  // buyer <-> seller of a marketplace purchase — deliberately bypasses every
-  // gym-based check below, since the marketplace is explicitly cross-gym.
-  if (await hasMarketplacePurchaseRelationship(supabase, userA, userB)) return true;
 
   // Gather each user's gym contexts in parallel.
   const [a, b] = await Promise.all([

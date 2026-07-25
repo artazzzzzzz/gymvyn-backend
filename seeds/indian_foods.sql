@@ -90,7 +90,7 @@ VALUES
 ('Naan plain',                 'सादा नान',            'roti_rice', 260, 7.0,  45.0, 5.5,  2.0, 1, 'piece',  '1 plain naan',                                 false, true, 'IFCT-2017'),
 ('Butter naan',                'बटर नान',             'roti_rice', 310, 7.0,  45.0, 11.0, 2.0, 1, 'piece',  '1 butter naan',                                false, true, 'IFCT-2017'),
 ('Garlic naan',                'लहसुन नान',           'roti_rice', 300, 7.5,  44.0, 10.0, 2.0, 1, 'piece',  '1 garlic naan',                                false, true, 'IFCT-2017'),
-('Paratha plain',              'सादा पराठा',          'roti_rice', 200, 5.0,  28.0, 8.0,  2.5, 1, 'piece',  '1 plain paratha with ghee',                    false, true, 'IFCT-2017'),
+('Plain paratha with ghee',    'सादा पराठा',          'roti_rice', 200, 5.0,  28.0, 8.0,  2.5, 1, 'piece',  '1 plain paratha with ghee',                    false, true, 'IFCT-2017'),
 ('Bajra roti',                 'बाजरा रोटी',          'roti_rice', 120, 3.5,  20.0, 3.0,  3.0, 1, 'piece',  '1 bajra roti',                                 false, true, 'IFCT-2017'),
 ('Jowar roti',                 'ज्वार रोटी',          'roti_rice', 100, 3.0,  20.0, 1.5,  3.5, 1, 'piece',  '1 jowar roti',                                 false, true, 'IFCT-2017'),
 ('Ragi roti',                  'रागी रोटी',           'roti_rice', 110, 3.0,  22.0, 1.5,  4.0, 1, 'piece',  '1 ragi roti',                                  false, true, 'IFCT-2017'),

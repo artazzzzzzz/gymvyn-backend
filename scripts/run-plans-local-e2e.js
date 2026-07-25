@@ -174,11 +174,11 @@ async function main() {
     if (!ownedPurchase.response.ok || otherBuyerPurchase.response.status !== 404) fail('purchase detail ownership was not enforced');
     if (sql(`SELECT count(*) FROM plans_purchases WHERE id IN ('${inrPurchase.body.id}', '${usdPurchase.body.id}') AND status = 'payment_pending' AND workout_assigned_plan_id IS NULL AND diet_assigned_plan_id IS NULL;`).trim() !== '2') fail('purchase skeleton wrote delivery data or changed its pending status');
     const siteBase = `http://localhost:${SITE_PORT}`;
-    site = spawn('npm', ['run', 'dev', '--', '--port', String(SITE_PORT)], { cwd: PLANS_SITE_ROOT, env: { ...process.env, NEXT_PUBLIC_API_BASE_URL: apiBase }, stdio: 'ignore' });
+    site = spawn('npm', ['run', 'dev', '--', '--port', String(SITE_PORT)], { cwd: PLANS_SITE_ROOT, env: { ...process.env, NEXT_PUBLIC_API_BASE_URL: apiBase, NEXT_PUBLIC_SUPABASE_URL: local.API_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY: local.ANON_KEY }, stdio: 'ignore' });
     await waitForServer(siteBase, site, '/plans');
     const plansPage = await (await fetch(`${siteBase}/plans`)).text();
     const detailPage = await (await fetch(`${siteBase}/plans/${slug}`)).text();
-    if (!plansPage.includes('Local E2E Strength') || !detailPage.includes('Local E2E Strength') || !detailPage.includes('Purchasing is coming soon.')) fail('standalone public pages did not render the published listing');
+    if (!plansPage.includes('Local E2E Strength') || !detailPage.includes('Local E2E Strength') || !detailPage.includes('Sign in to get this plan')) fail('standalone public pages did not render the published listing and purchase sign-in gate');
     const unpublished = await request(apiBase, `/api/plans/trainer/listings/${id}/unpublish`, trainerToken, { method: 'POST' });
     if (!unpublished.response.ok || unpublished.body.status !== 'unpublished') fail('listing did not unpublish');
     const hiddenAgain = await request(apiBase, '/api/plans/listings');

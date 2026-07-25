@@ -45,6 +45,56 @@ test('Gymvyn Plans purchase validation accepts only a listing and INR or USD', (
   assert.equal(_private.commissionMinor(100, 500), 5);
 });
 
+test('Gymvyn Plans Razorpay order helpers use minor units and expose no secret', async () => {
+  const received = [];
+  const order = await _private.createRazorpayOrder({
+    purchaseId: '12345678-1234-1234-1234-123456789012', amountMinor: 2000, currency: 'INR',
+    razorpay: { orders: { create: async (payload) => { received.push(payload); return { id: 'order_test_123' }; } } },
+  });
+  assert.equal(order.id, 'order_test_123');
+  assert.deepEqual(received[0], {
+    amount: 2000, currency: 'INR', receipt: 'plans_12345678123412341234123456789012',
+    notes: { plans_purchase_id: '12345678-1234-1234-1234-123456789012' },
+  });
+  await _private.createRazorpayOrder({
+    purchaseId: '87654321-4321-4321-4321-210987654321', amountMinor: 100, currency: 'USD',
+    razorpay: { orders: { create: async (payload) => { received.push(payload); return { id: 'order_test_456' }; } } },
+  });
+  assert.equal(received[1].amount, 100);
+  assert.equal(received[1].currency, 'USD');
+  assert.equal(_private.plansPaymentsEnabled({}), false);
+  assert.equal(_private.plansPaymentsEnabled({ PLANS_PAYMENTS_ENABLED: 'true' }), true);
+  assert.throws(() => _private.razorpaySettings({ RAZORPAY_KEY_ID: 'rzp_test_key' }), /incomplete/);
+  const response = _private.paymentOrderResponse({ id: 'purchase-id', status: 'payment_pending', final_price_minor: 2000, currency: 'INR', provider_order_id: 'order_test_123' }, 'rzp_test_public');
+  assert.deepEqual(response, { purchase_id: 'purchase-id', status: 'payment_pending', amount: 2000, currency: 'INR', provider: 'razorpay', provider_order_id: 'order_test_123', razorpay_key_id: 'rzp_test_public' });
+  assert.doesNotMatch(JSON.stringify(response), /secret/i);
+});
+
+test('Gymvyn Plans Razorpay persistence stores an order or marks only the purchase failed', async () => {
+  const calls = [];
+  const successfulDatabase = {
+    from: () => ({ update: (values) => ({ eq: (_column, id) => ({ select: () => ({ single: async () => {
+      calls.push({ values, id });
+      return { data: { id, status: 'payment_pending', currency: 'USD', final_price_minor: 100, provider_order_id: values.provider_order_id }, error: null };
+    } }) }) }) }),
+  };
+  const stored = await _private.storeProviderOrder(successfulDatabase, 'purchase-id', 'order_test_123');
+  assert.equal(stored.provider_order_id, 'order_test_123');
+  assert.equal(calls[0].id, 'purchase-id');
+  assert.equal(calls[0].values.provider_order_id, 'order_test_123');
+  assert.ok(calls[0].values.updated_at);
+
+  const failedCalls = [];
+  const failingDatabase = {
+    from: () => ({ update: (values) => ({ eq: (_column, id) => { failedCalls.push({ values, id }); return { error: null }; } }) }),
+  };
+  await _private.failPendingPurchase(failingDatabase, 'purchase-id');
+  assert.deepEqual(failedCalls[0].values.status, 'failed');
+  assert.equal(failedCalls[0].id, 'purchase-id');
+  assert.equal(failedCalls[0].values.workout_assigned_plan_id, undefined);
+  assert.equal(failedCalls[0].values.diet_assigned_plan_id, undefined);
+});
+
 test('Gymvyn Plans exposes the required public, trainer, buyer, review, and guarded admin paths', () => {
   const router = require('../routes/plansRoutes');
   const paths = router.stack

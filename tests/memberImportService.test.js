@@ -235,6 +235,16 @@ describe('member import profile and membership handling', () => {
     assert.equal(result.results[0].status, RESULT_STATUS.VALIDATION_ERROR);
     assert.equal(result.results[1].status, RESULT_STATUS.CREATED_UNCLAIMED_MEMBER);
   });
+
+  test('negative monthly_fee is rejected instead of imported as a negative fee', async () => {
+    const repo = makeRepo();
+    const result = await ownerRequest(repo, [
+      { full_name: 'Negative Fee', phone: '9876543210', monthly_fee: '-500' },
+    ]);
+    assert.equal(result.results[0].status, RESULT_STATUS.VALIDATION_ERROR);
+    assert.match(result.results[0].message, /negative/i);
+    assert.equal(repo.state.memberships.size, 0);
+  });
 });
 
 describe('member import row limit', () => {

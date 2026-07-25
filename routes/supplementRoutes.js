@@ -2,6 +2,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
+const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -19,18 +20,6 @@ cloudinary.config({
 const imgUpload = multer({ storage: multer.memoryStorage() });
 
 // ── Auth + profile middleware ──────────────────────────────────────────────────
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
 
 async function withProfile(req, res, next) {
   const { data, error } = await supabase
@@ -306,7 +295,7 @@ router.post(
       const result = await new Promise((resolve, reject) => {
         cloudinary.uploader.upload_stream(
           {
-            folder:          'fitforge/supplements',
+            folder:          'gymvyn/supplements',
             public_id:       `product-${id}`,
             overwrite:       true,
             transformation:  [{ width: 800, height: 800, crop: 'limit' }],

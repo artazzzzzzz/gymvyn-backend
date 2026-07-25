@@ -1,5 +1,8 @@
 const express = require('express');
+const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
+const { validate } = require('../src/utils/validate');
+const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -8,19 +11,24 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Payout amount capped at ₹10,00,000, matching the membership-plan price cap
+// in server.js -- amount was previously only checked for `!= null`, so a
+// negative number, NaN, or Infinity all passed through straight into the
+// payouts ledger (NaN/Infinity silently became `null` on JSON serialization;
+// a negative amount was inserted as-is).
+const payoutSchema = z.object({
+  gymId: z.string().min(1, 'gymId is required'),
+  trainerId: z.string().min(1, 'trainerId is required'),
+  period_start: z.string().optional().nullable(),
+  period_end: z.string().optional().nullable(),
+  amount: z.number({ error: 'amount must be a number' })
+    .positive('amount must be a positive number')
+    .max(1_000_000, 'amount exceeds maximum allowed value'),
+  breakdown: z.record(z.any()).optional().nullable(),
+  notes: z.string().trim().max(2000, 'notes must be 2000 characters or fewer').optional().nullable(),
+});
+
 // ── Middleware ───────────────────────────────────────────────────────────────
-
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
-}
 
 // Verify req.user owns the gym identified by `gymId` (param or body).
 async function ownsGym(userId, gymId) {
@@ -207,13 +215,9 @@ router.put('/rate/:trainerId', auth, async (req, res) => {
 });
 
 // POST /api/trainer-earnings/payout
-router.post('/payout', auth, async (req, res) => {
+router.post('/payout', auth, validate(payoutSchema), async (req, res) => {
   try {
-    const { gymId, trainerId, period_start, period_end, amount, breakdown, notes } = req.body || {};
-    if (!gymId || !trainerId) {
-      return res.status(400).json({ error: 'gymId and trainerId are required' });
-    }
-    if (amount == null) return res.status(400).json({ error: 'amount is required' });
+    const { gymId, trainerId, period_start, period_end, amount, breakdown, notes } = req.body;
 
     if (!(await ownsGym(req.user.id, gymId))) {
       return res.status(403).json({ error: 'You do not own this gym' });
@@ -226,7 +230,7 @@ router.post('/payout', auth, async (req, res) => {
         trainer_id: trainerId,
         period_start: period_start || null,
         period_end: period_end || null,
-        amount: Number(amount),
+        amount,
         breakdown: breakdown || null,
         notes: notes || null,
         status: 'paid',

@@ -6,6 +6,8 @@ const {
   fetchFullTemplate,
   fetchFullAssignedPlan,
 } = require('../src/utils/dietPlanHelpers');
+const { validateDietPlanTarget } = require('../src/utils/nutritionTargetValidator');
+const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -14,16 +16,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing auth token' });
+function invalidTargetResponse(res, target) {
+  const validation = validateDietPlanTarget(target);
+  if (validation.valid) return false;
+  res.status(validation.status || 400).json({ error: validation.error, invalid_fields: validation.invalidFields });
+  return true;
+}
 
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid auth token' });
-
-  req.user = data.user;
-  next();
+function hasInvalidDayTarget(days) {
+  return (days || []).find(day => !validateDietPlanTarget(day).valid);
 }
 
 // GET /api/diet-plans/templates — trainer's own templates
@@ -46,6 +47,9 @@ router.get('/templates', auth, async (req, res) => {
 router.post('/templates', auth, async (req, res) => {
   try {
     const { name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, days } = req.body;
+    if (invalidTargetResponse(res, { calories_target, protein_g, carbs_g, fat_g })) return;
+    const invalidDay = hasInvalidDayTarget(days);
+    if (invalidDay) return invalidTargetResponse(res, invalidDay);
 
     const { data: template, error } = await supabase
       .from('diet_plan_templates')
@@ -65,11 +69,56 @@ router.post('/templates', auth, async (req, res) => {
 
     await insertTemplateDays(supabase, template.id, days);
     const full = await fetchFullTemplate(supabase, template.id);
+    await supabase.from('diet_template_versions').insert({
+      template_id: template.id, version: 1, snapshot: full, created_by: req.user.id,
+    });
     res.status(201).json(full);
   } catch (err) {
     console.error('POST /api/diet-plans/templates error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Additive lifecycle endpoints. Existing template GET/PUT/DELETE contracts are
+// intentionally untouched for current clients.
+router.post('/templates/:id/duplicate', auth, async (req, res) => {
+  try {
+    const source = await fetchFullTemplate(supabase, req.params.id);
+    if (!source || source.trainer_id !== req.user.id) return res.status(404).json({ error: 'Not found' });
+    const { data: copy, error } = await supabase.from('diet_plan_templates').insert({
+      trainer_id: req.user.id, name: req.body.name?.trim() || `${source.name} copy`,
+      description: source.description, detail_level: source.detail_level,
+      calories_target: source.calories_target, protein_g: source.protein_g, carbs_g: source.carbs_g,
+      fat_g: source.fat_g, target_ranges: source.target_ranges || {}, status: 'draft', version: 1,
+    }).select().single();
+    if (error) throw error;
+    await insertTemplateDays(supabase, copy.id, source.days);
+    res.status(201).json(await fetchFullTemplate(supabase, copy.id));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.patch('/templates/:id/lifecycle', auth, async (req, res) => {
+  try {
+    const status = req.body.status;
+    if (!['draft', 'published', 'archived'].includes(status)) return res.status(400).json({ error: 'Invalid template status' });
+    const { data, error } = await supabase.from('diet_plan_templates').update({
+      status, archived_at: status === 'archived' ? new Date().toISOString() : null, updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id).eq('trainer_id', req.user.id).select().maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Not found' });
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/templates/:id/versions', auth, async (req, res) => {
+  try {
+    const template = await fetchFullTemplate(supabase, req.params.id);
+    if (!template || template.trainer_id !== req.user.id) return res.status(404).json({ error: 'Not found' });
+    const { data, error } = await supabase.from('diet_template_versions').select('*')
+      .eq('template_id', template.id).order('version', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /api/diet-plans/templates/:id — fetch full template
@@ -90,20 +139,24 @@ router.get('/templates/:id', auth, async (req, res) => {
 router.put('/templates/:id', auth, async (req, res) => {
   try {
     const { name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, days } = req.body;
+    if (invalidTargetResponse(res, { calories_target, protein_g, carbs_g, fat_g })) return;
+    const invalidDay = hasInvalidDayTarget(days);
+    if (invalidDay) return invalidTargetResponse(res, invalidDay);
 
     // Verify ownership
     const { data: existing, error: fetchErr } = await supabase
       .from('diet_plan_templates')
-      .select('id, trainer_id')
+      .select('id, trainer_id, version')
       .eq('id', req.params.id)
       .single();
     if (fetchErr || !existing || existing.trainer_id !== req.user.id) {
       return res.status(404).json({ error: 'Not found' });
     }
 
+    const nextVersion = (Number(existing.version) || 1) + 1;
     const { error: updateErr } = await supabase
       .from('diet_plan_templates')
-      .update({ name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, updated_at: new Date().toISOString() })
+      .update({ name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, version: nextVersion, updated_at: new Date().toISOString() })
       .eq('id', req.params.id);
     if (updateErr) throw updateErr;
 
@@ -114,6 +167,9 @@ router.put('/templates/:id', auth, async (req, res) => {
     await insertTemplateDays(supabase, req.params.id, days);
 
     const full = await fetchFullTemplate(supabase, req.params.id);
+    await supabase.from('diet_template_versions').insert({
+      template_id: full.id, version: nextVersion, snapshot: full, created_by: req.user.id,
+    });
     res.json(full);
   } catch (err) {
     console.error('PUT /api/diet-plans/templates/:id error:', err);
@@ -141,6 +197,9 @@ router.delete('/templates/:id', auth, async (req, res) => {
 router.post('/assign', auth, async (req, res) => {
   try {
     const body = req.body;
+    if (invalidTargetResponse(res, body)) return;
+    const invalidDay = hasInvalidDayTarget(body.days);
+    if (invalidDay) return invalidTargetResponse(res, invalidDay);
 
     // Verify client is a CURRENTLY active client of this trainer — a stale
     // 'removed' row from a client who unlinked must not authorize this.
@@ -167,9 +226,10 @@ router.post('/assign', auth, async (req, res) => {
     let days = body.days || [];
     if (body.template_id) {
       const template = await fetchFullTemplate(supabase, body.template_id);
-      if (template) {
-        days = template.days;
+      if (!template || template.trainer_id !== req.user.id) {
+        return res.status(404).json({ error: 'Template not found' });
       }
+      days = template.days;
     }
 
     // Insert assigned plan

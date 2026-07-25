@@ -1,5 +1,9 @@
 # Gymvyn direct-message schema verification
 
+> Historical note: Gymvyn Plans Phase 0 removed marketplace purchases as a
+> messaging eligibility path. Marketplace findings below describe the legacy
+> implementation and must not be read as current behavior.
+
 **Verified:** 2026-07-17 against configured Supabase project `jaxnqttycxeavwhcsoyv`, using catalog queries and aggregate SELECTs only. No data, schema, policy, function, publication, deployment, or application behavior was changed.
 
 ## 1. Executive summary

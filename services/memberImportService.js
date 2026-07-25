@@ -78,6 +78,7 @@ function normalizeImportRow(row) {
   if (startDate?.error) errors.push('Membership start date is invalid.');
   if (endDate?.error) errors.push('Membership expiry date is invalid.');
   if (monthlyFee?.error) errors.push('Fee amount is invalid.');
+  if (typeof monthlyFee === 'number' && monthlyFee < 0) errors.push('Fee amount must not be negative.');
   if (height?.error) errors.push('Height is invalid.');
   if (weight?.error) errors.push('Weight is invalid.');
 

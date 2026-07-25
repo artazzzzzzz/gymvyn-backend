@@ -23,7 +23,7 @@ const supabase = createClient(
 );
 
 const VIDEO_DIR   = '/Users/artazayaz/Downloads/Exercise (whitout watermark)/exercise (whitout watermark)/men';
-const DB_PATH     = path.resolve(__dirname, '../../fitforge-frontend/src/data/exerciseDatabase.js');
+const DB_PATH     = path.resolve(__dirname, '../../gymvyn-frontend/src/data/exerciseDatabase.js');
 const UNMATCHED_OUT = path.resolve(__dirname, 'unmatched_videos.txt');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
