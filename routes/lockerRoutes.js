@@ -1,7 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
-const { auth } = require('../middleware/auth');
+const { auth, requireGymOwner } = require('../middleware/auth');
 const { validate } = require('../src/utils/validate');
 
 const router = express.Router();
@@ -38,26 +38,38 @@ async function withProfile(req, res, next) {
   next();
 }
 
-// Resolves gym and attaches lockers_enabled flag to req.
-async function ownerOnly(req, res, next) {
-  if (req.profile.role !== 'gym_owner') {
-    return res.status(403).json({ error: 'Gym owner access required' });
-  }
+// Verifies the caller is a gym owner AND owns the gym identified by
+// `getGymId(req)` (a query param or body field, per route), then attaches
+// the lockers_enabled flag to req. Wraps the shared requireGymOwner (which
+// only reads req.params.gymId) instead of duplicating its ownership SQL a
+// fifth time across route files.
+function ownerOnly(getGymId) {
+  return (req, res, next) => {
+    if (req.profile.role !== 'gym_owner') {
+      return res.status(403).json({ error: 'Gym owner access required' });
+    }
 
-  const { data, error } = await supabase
-    .from('gyms')
-    .select('id, lockers_enabled')
-    .eq('owner_id', req.user.id)
-    .eq('is_active', true)
-    .maybeSingle();
+    const gymId = getGymId(req);
+    if (!gymId) return res.status(400).json({ error: 'gym_id is required' });
 
-  if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
-  if (!data)  return res.status(404).json({ error: 'No active gym found for this owner' });
+    req.params.gymId = gymId;
+    req.gymId = gymId;
+    return requireGymOwner(req, res, async () => {
+      const { data, error } = await supabase
+        .from('gyms')
+        .select('lockers_enabled')
+        .eq('id', gymId)
+        .maybeSingle();
 
-  req.gymId = data.id;
-  req.lockersEnabled = data.lockers_enabled;
-  next();
+      if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
+      req.lockersEnabled = data?.lockers_enabled ?? false;
+      next();
+    });
+  };
 }
+
+const gymIdFromQuery = (req) => req.query.gym_id;
+const gymIdFromBody = (req) => req.body?.gym_id;
 
 // Applied after ownerOnly on every route EXCEPT /settings
 function requireLockersEnabled(req, res, next) {
@@ -72,7 +84,7 @@ function requireLockersEnabled(req, res, next) {
 // GET /api/lockers/settings
 router.get(
   '/settings',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       res.json({ lockers_enabled: req.lockersEnabled });
@@ -86,7 +98,7 @@ router.get(
 // PATCH /api/lockers/settings
 router.patch(
   '/settings',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromBody),
   async (req, res) => {
     try {
       const { lockers_enabled } = req.body;
@@ -113,7 +125,7 @@ router.patch(
 // GET /api/lockers/expiring-soon
 router.get(
   '/expiring-soon',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const threshold = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
@@ -165,7 +177,7 @@ router.get(
 // GET /api/lockers
 router.get(
   '/',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { data: lockers, error } = await supabase
@@ -240,7 +252,7 @@ router.get(
 // POST /api/lockers
 router.post(
   '/',
-  auth, withProfile, ownerOnly, requireLockersEnabled, validate(lockerCreateSchema),
+  auth, withProfile, ownerOnly(gymIdFromBody), requireLockersEnabled, validate(lockerCreateSchema),
   async (req, res) => {
     try {
       const { label, is_paid, price } = req.body;
@@ -281,7 +293,7 @@ router.post(
 // PATCH /api/lockers/:id
 router.patch(
   '/:id',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -388,7 +400,7 @@ router.patch(
 // DELETE /api/lockers/:id
 router.delete(
   '/:id',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -438,7 +450,7 @@ router.delete(
 // POST /api/lockers/:id/assign
 router.post(
   '/:id/assign',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -547,7 +559,7 @@ router.post(
 // PATCH /api/lockers/:id/end-assignment
 router.patch(
   '/:id/end-assignment',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -609,7 +621,7 @@ router.patch(
 // PATCH /api/lockers/:id/payment
 router.patch(
   '/:id/payment',
-  auth, withProfile, ownerOnly, requireLockersEnabled,
+  auth, withProfile, ownerOnly(gymIdFromQuery), requireLockersEnabled,
   async (req, res) => {
     try {
       const { id } = req.params;

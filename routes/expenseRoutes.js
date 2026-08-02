@@ -1,7 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
-const { auth } = require('../middleware/auth');
+const { auth, requireGymOwner } = require('../middleware/auth');
 const { validate } = require('../src/utils/validate');
 
 const router = express.Router();
@@ -48,24 +48,27 @@ async function withProfile(req, res, next) {
   next();
 }
 
-async function ownerOnly(req, res, next) {
-  if (req.profile.role !== 'gym_owner') {
-    return res.status(403).json({ error: 'Gym owner access required' });
-  }
+// Verifies the caller is a gym owner AND owns the gym identified by
+// `getGymId(req)` (a query param or body field, per route). Wraps the
+// shared requireGymOwner (which only reads req.params.gymId) instead of
+// duplicating its ownership SQL a fifth time across route files.
+function ownerOnly(getGymId) {
+  return (req, res, next) => {
+    if (req.profile.role !== 'gym_owner') {
+      return res.status(403).json({ error: 'Gym owner access required' });
+    }
 
-  const { data, error } = await supabase
-    .from('gyms')
-    .select('id')
-    .eq('owner_id', req.user.id)
-    .eq('is_active', true)
-    .maybeSingle();
+    const gymId = getGymId(req);
+    if (!gymId) return res.status(400).json({ error: 'gym_id is required' });
 
-  if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
-  if (!data)  return res.status(404).json({ error: 'No active gym found for this owner' });
-
-  req.gymId = data.id;
-  next();
+    req.params.gymId = gymId;
+    req.gymId = gymId;
+    return requireGymOwner(req, res, next);
+  };
 }
+
+const gymIdFromQuery = (req) => req.query.gym_id;
+const gymIdFromBody = (req) => req.body?.gym_id;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -89,7 +92,7 @@ function resolveDateRange(startDate, endDate) {
 
 router.get(
   '/summary/monthly',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       // Build a series of the last 6 months (oldest → newest).
@@ -133,7 +136,7 @@ router.get(
 
 router.get(
   '/summary',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { startDate, endDate } = req.query;
@@ -180,7 +183,7 @@ router.get(
 
 router.get(
   '/',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { category, startDate, endDate } = req.query;
@@ -216,7 +219,7 @@ router.get(
 
 router.post(
   '/',
-  auth, withProfile, ownerOnly, validate(expenseCreateSchema),
+  auth, withProfile, ownerOnly(gymIdFromBody), validate(expenseCreateSchema),
   async (req, res) => {
     try {
       const { category, description, amount, expense_date } = req.body;
@@ -246,7 +249,7 @@ router.post(
 
 router.patch(
   '/:id',
-  auth, withProfile, ownerOnly, validate(expenseUpdateSchema),
+  auth, withProfile, ownerOnly(gymIdFromQuery), validate(expenseUpdateSchema),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -286,7 +289,7 @@ router.patch(
 
 router.delete(
   '/:id',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { id } = req.params;
