@@ -279,18 +279,6 @@ app.post('/api/gyms', auth, async (req, res) => {
       return res.status(400).json({ message: 'Missing required fields: name, city, and gym_type are required' });
     }
 
-    const { data: existingGym, error: checkErr } = await supabase
-      .from('gyms')
-      .select('id')
-      .eq('owner_id', user_id)
-      .eq('is_active', true)
-      .maybeSingle();
-      
-    if (checkErr && checkErr.code !== 'PGRST116') throw checkErr;
-    if (existingGym) {
-      return res.status(409).json({ error: 'Gym already registered' });
-    }
-
     const DEFAULT_HOURS = {
       mon: { open: '06:00', close: '22:00', closed: false },
       tue: { open: '06:00', close: '22:00', closed: false },
@@ -402,6 +390,24 @@ app.get('/api/gyms/owner/:userId', auth, async (req, res) => {
   } catch (err) {
     console.error('GET /api/gyms/owner/:userId error:', err);
     res.status(500).json({ message: err.message || 'Failed to check gym ownership' });
+  }
+});
+
+// Multi-gym-aware: returns every active gym the caller owns, not just one.
+// Must be registered before /:userId so Express doesn't match "mine" as a userId param.
+app.get('/api/gyms/mine', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('gyms')
+      .select('*')
+      .eq('owner_id', req.user.id)
+      .eq('is_active', true)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ gyms: data || [] });
+  } catch (err) {
+    console.error('GET /api/gyms/mine error:', err);
+    res.status(500).json({ message: err.message || 'Failed to fetch gyms' });
   }
 });
 
