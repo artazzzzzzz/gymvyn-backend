@@ -1,7 +1,8 @@
 const express = require('express');
 const { z } = require('zod');
 const { createClient } = require('@supabase/supabase-js');
-const { auth, requireGymOwner } = require('../middleware/auth');
+const { auth } = require('../middleware/auth');
+const { ownerOnly, gymIdFromQuery, gymIdFromBody } = require('../middleware/ownerScope');
 const { validate } = require('../src/utils/validate');
 
 const router = express.Router();
@@ -47,28 +48,6 @@ async function withProfile(req, res, next) {
   req.profile = data;
   next();
 }
-
-// Verifies the caller is a gym owner AND owns the gym identified by
-// `getGymId(req)` (a query param or body field, per route). Wraps the
-// shared requireGymOwner (which only reads req.params.gymId) instead of
-// duplicating its ownership SQL a fifth time across route files.
-function ownerOnly(getGymId) {
-  return (req, res, next) => {
-    if (req.profile.role !== 'gym_owner') {
-      return res.status(403).json({ error: 'Gym owner access required' });
-    }
-
-    const gymId = getGymId(req);
-    if (!gymId) return res.status(400).json({ error: 'gym_id is required' });
-
-    req.params.gymId = gymId;
-    req.gymId = gymId;
-    return requireGymOwner(req, res, next);
-  };
-}
-
-const gymIdFromQuery = (req) => req.query.gym_id;
-const gymIdFromBody = (req) => req.body?.gym_id;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
