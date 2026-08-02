@@ -3,6 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
 const { auth } = require('../middleware/auth');
+const { ownerOnly, gymIdFromQuery, gymIdFromBody } = require('../middleware/ownerScope');
 
 const router = express.Router();
 
@@ -32,28 +33,6 @@ async function withProfile(req, res, next) {
   if (!data)  return res.status(401).json({ error: 'User profile not found' });
 
   req.profile = data;
-  next();
-}
-
-// ── Gym-owner guard ───────────────────────────────────────────────────────────
-// Resolves the owner's gym_id and attaches it to req.gymId.
-
-async function ownerOnly(req, res, next) {
-  if (req.profile.role !== 'gym_owner') {
-    return res.status(403).json({ error: 'Gym owner access required' });
-  }
-
-  const { data, error } = await supabase
-    .from('gyms')
-    .select('id')
-    .eq('owner_id', req.user.id)
-    .eq('is_active', true)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
-  if (!data)  return res.status(404).json({ error: 'No active gym found for this owner' });
-
-  req.gymId = data.id;
   next();
 }
 
@@ -89,7 +68,7 @@ async function memberOnly(req, res, next) {
 // this ordering is correct practice for future-proofing).
 router.get(
   '/products/low-stock',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { data, error } = await supabase
@@ -114,7 +93,7 @@ router.get(
 // GET /api/supplements/products — all products for owner's gym (active + inactive)
 router.get(
   '/products',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { data, error } = await supabase
@@ -135,7 +114,7 @@ router.get(
 // POST /api/supplements/products — create a product
 router.post(
   '/products',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromBody),
   async (req, res) => {
     try {
       const {
@@ -174,7 +153,7 @@ router.post(
 // PATCH /api/supplements/products/:id — update product
 router.patch(
   '/products/:id',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -227,7 +206,7 @@ router.patch(
 // set is_active=false to delist it (preserves snapshot integrity in orders).
 router.delete(
   '/products/:id',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -275,7 +254,7 @@ router.delete(
 // POST /api/supplements/products/:id/upload-image — Cloudinary product image
 router.post(
   '/products/:id/upload-image',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   imgUpload.single('image'),
   async (req, res) => {
     try {
@@ -324,7 +303,7 @@ router.post(
 // GET /api/supplements/orders — all orders for owner's gym; ?status= filter
 router.get(
   '/orders',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { status } = req.query;
@@ -374,7 +353,7 @@ const VALID_STATUS_TRANSITIONS = {
 // PATCH /api/supplements/orders/:id/status — owner updates order status
 router.patch(
   '/orders/:id/status',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { id } = req.params;
@@ -417,7 +396,7 @@ router.patch(
 // PATCH /api/supplements/orders/:id/payment — owner marks order as paid
 router.patch(
   '/orders/:id/payment',
-  auth, withProfile, ownerOnly,
+  auth, withProfile, ownerOnly(gymIdFromQuery),
   async (req, res) => {
     try {
       const { id } = req.params;

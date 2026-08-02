@@ -1,6 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
+const { ownerOnly, gymIdFromParams } = require('../middleware/ownerScope');
 
 const router = express.Router({ mergeParams: true });
 
@@ -25,34 +26,7 @@ async function withProfile(req, res, next) {
   next();
 }
 
-async function ownerOnly(req, res, next) {
-  if (req.profile.role !== 'gym_owner') {
-    return res.status(403).json({ error: 'Gym owner access required' });
-  }
-
-  const { data, error } = await supabase
-    .from('gyms')
-    .select('id')
-    .eq('owner_id', req.user.id)
-    .eq('is_active', true)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
-  if (!data)  return res.status(404).json({ error: 'No active gym found for this owner' });
-
-  req.gymId = data.id;
-  next();
-}
-
-// Confirm the :gymId URL param matches the authenticated owner's gym.
-function verifyGymParam(req, res, next) {
-  if (req.params.gymId !== req.gymId) {
-    return res.status(403).json({ error: 'Access denied to this gym' });
-  }
-  next();
-}
-
-const MW = [auth, withProfile, ownerOnly, verifyGymParam];
+const MW = [auth, withProfile, ownerOnly(gymIdFromParams)];
 
 // ── GET /api/equipment/:gymId ─────────────────────────────────────────────────
 
