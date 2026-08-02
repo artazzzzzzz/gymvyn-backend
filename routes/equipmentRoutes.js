@@ -59,7 +59,7 @@ const MW = [auth, withProfile, ownerOnly, verifyGymParam];
 router.get('/:gymId', ...MW, async (req, res) => {
   try {
     const { data, error } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .select('*')
       .eq('gym_id', req.gymId)
       .order('category', { ascending: true })
@@ -86,7 +86,7 @@ router.post('/:gymId', ...MW, async (req, res) => {
     if (!category?.trim()) return res.status(400).json({ error: 'category is required' });
 
     const { data, error } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .insert({
         gym_id:           req.gymId,
         name:             name.trim(),
@@ -115,7 +115,7 @@ router.patch('/:gymId/:id', ...MW, async (req, res) => {
     const { id } = req.params;
 
     const { data: existing, error: fetchErr } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .select('id')
       .eq('id', id)
       .eq('gym_id', req.gymId)
@@ -138,7 +138,7 @@ router.patch('/:gymId/:id', ...MW, async (req, res) => {
     }
 
     const { data, error } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .update(updates)
       .eq('id', id)
       .eq('gym_id', req.gymId)
@@ -160,7 +160,7 @@ router.delete('/:gymId/:id', ...MW, async (req, res) => {
     const { id } = req.params;
 
     const { data: existing, error: fetchErr } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .select('id')
       .eq('id', id)
       .eq('gym_id', req.gymId)
@@ -170,7 +170,7 @@ router.delete('/:gymId/:id', ...MW, async (req, res) => {
     if (!existing) return res.status(404).json({ error: 'Equipment item not found in your gym' });
 
     const { error } = await supabase
-      .from('equipment')
+      .from('gym_equipment')
       .delete()
       .eq('id', id)
       .eq('gym_id', req.gymId);
