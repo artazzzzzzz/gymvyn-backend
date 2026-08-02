@@ -441,19 +441,23 @@ router.delete('/templates/:templateId', auth, async (req, res) => {
 router.post('/assign-plan', auth, async (req, res) => {
   try {
     const { trainerId, clientId, templateId, type, name, planData, notes, startsAt, endsAt } = req.body;
-    if (!trainerId || !clientId || !type || !name) {
-      return res.status(400).json({ error: 'trainerId, clientId, type, name required' });
+    if (!clientId || !type || !name) {
+      return res.status(400).json({ error: 'clientId, type, name required' });
     }
-    if (req.user.id !== trainerId) return res.status(403).json({ error: 'Not authorized' });
+    // The authenticated user is always the acting trainer. Keep the legacy
+    // trainerId field as an optional anti-impersonation assertion, but never
+    // trust it as the source of ownership.
+    if (trainerId && req.user.id !== trainerId) return res.status(403).json({ error: 'Not authorized' });
+    const actingTrainerId = req.user.id;
 
-    const linked = await isLinkedPair(trainerId, clientId);
+    const linked = await isLinkedPair(actingTrainerId, clientId);
     if (!linked) return res.status(403).json({ error: 'Not authorized' });
 
     // Deactivate any existing active plan of same type for this client from this trainer
     await supabase
       .from('assigned_plans')
       .update({ status: 'replaced', updated_at: new Date().toISOString() })
-      .eq('trainer_id', trainerId)
+      .eq('trainer_id', actingTrainerId)
       .eq('client_id', clientId)
       .eq('type', type)
       .eq('status', 'active');
@@ -461,7 +465,7 @@ router.post('/assign-plan', auth, async (req, res) => {
     const { data, error } = await supabase
       .from('assigned_plans')
       .insert({
-        trainer_id: trainerId,
+        trainer_id: actingTrainerId,
         client_id: clientId,
         template_id: templateId || null,
         type,
@@ -488,17 +492,23 @@ router.post('/assign-plan', auth, async (req, res) => {
     // trainer-client eligibility was already confirmed above via
     // isLinkedPair, so this always succeeds; the hardened conversation RPC is
     // idempotent if one already exists from the invite/accept flow.
-    const convoId = await getOrCreateConversationIfAllowed(supabase, trainerId, clientId);
+    const convoId = await getOrCreateConversationIfAllowed(supabase, actingTrainerId, clientId);
 
     if (convoId) {
       await sendMessageAtomically(supabase, {
         conversationId: convoId,
-        senderId: trainerId,
+        senderId: actingTrainerId,
         content: `Assigned new ${type} plan: ${name}`,
       });
     }
 
-    res.json(data);
+    res.json({
+      assignment: data,
+      assignmentId: data.id,
+      clientId,
+      trainerId: actingTrainerId,
+      planId: data.template_id || null,
+    });
   } catch (err) {
     console.error('Assign plan error:', err);
     res.status(500).json({ error: err.message });

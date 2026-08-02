@@ -19,6 +19,7 @@ const PERMISSION_KEYS = [
   'manage_lockers',
   'view_supplements',
   'view_announcements',
+  'manage_feed',
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -546,10 +547,14 @@ router.post('/lockers/:lockerId/assign', authenticateToken, requireStaffRole, st
     if (locker.status !== 'available') return res.status(409).json({ error: `Locker "${locker.label}" is ${locker.status}` });
 
     const { data: membership, error: me } = await supabase
-      .from('gym_memberships').select('id')
+      .from('gym_memberships').select('id, start_date, end_date')
       .eq('gym_id', req.gymId).eq('user_id', member_id).eq('status', 'active').maybeSingle();
     if (me) throw me;
-    if (!membership) return res.status(400).json({ error: 'Member is not active in this gym' });
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const membershipIsCurrent = membership
+      && (!membership.start_date || membership.start_date <= today)
+      && (!membership.end_date || membership.end_date >= today);
+    if (!membershipIsCurrent) return res.status(400).json({ error: 'Member is not active in this gym' });
 
     const expiresAt = new Date(Date.now() + days * 86400000).toISOString();
     const { data: assignment, error: ae } = await supabase

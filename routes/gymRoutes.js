@@ -68,10 +68,26 @@ router.post('/join', auth, async (req, res) => {
     const { join_code } = req.body;
     if (!join_code) return res.status(400).json({ error: 'join_code is required' });
 
+    // A member join code is not a role-conversion tool. In particular, an
+    // owner or trainer must not be able to use a code from another gym to
+    // acquire a member relationship there.
+    const { data: caller, error: callerErr } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (callerErr) throw callerErr;
+    if (!caller || !['consumer', 'gym_member'].includes(caller.role)) {
+      return res.status(403).json({ error: 'Only member accounts can join a gym with a member code' });
+    }
+
     const { data: gym, error: gymErr } = await supabase
       .from('gyms')
       .select('id, name')
-      .eq('join_code', join_code.trim().toUpperCase())
+      // Codes are normalized by the UI, but older gyms may have a lowercase
+      // stored code. Matching case-insensitively keeps a legitimate QR/code
+      // invite usable without changing which gym it resolves to.
+      .ilike('join_code', join_code.trim())
       .eq('is_active', true)
       .maybeSingle();
 

@@ -467,14 +467,18 @@ router.post(
       // Validate member belongs to this gym
       const { data: membership, error: memErr } = await supabase
         .from('gym_memberships')
-        .select('id')
+        .select('id, start_date, end_date')
         .eq('gym_id', req.gymId)
         .eq('user_id', member_id)
         .eq('status', 'active')
         .maybeSingle();
 
       if (memErr) throw memErr;
-      if (!membership) {
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      const membershipIsCurrent = membership
+        && (!membership.start_date || membership.start_date <= today)
+        && (!membership.end_date || membership.end_date >= today);
+      if (!membershipIsCurrent) {
         return res.status(400).json({ error: 'Member is not an active member of this gym' });
       }
 

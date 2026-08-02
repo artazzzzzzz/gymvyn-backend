@@ -669,3 +669,69 @@ describe('relationship status and switch regressions', () => {
     }
   });
 });
+
+describe('trainer AI workout assignment persistence', () => {
+  const marker = `${CODEX_AUTH_TEST}:DEF036`;
+  let assignmentId;
+  let personalPlanId;
+
+  after(async () => {
+    if (assignmentId) await adminDb.from('assigned_plans').delete().eq('id', assignmentId);
+    if (personalPlanId) await adminDb.from('user_workout_plans').delete().eq('id', personalPlanId);
+  });
+
+  test('linked trainer save creates assigned plan only, while member save remains personal', async () => {
+    const beforePersonal = await adminDb
+      .from('user_workout_plans').select('id').eq('user_id', ids.client1).eq('name', marker);
+    assert.ifError(beforePersonal.error);
+
+    const trainerSave = await hit('POST', '/api/trainer/assign-plan', {
+      token: tokens.trainer1,
+      body: {
+        clientId: ids.client1,
+        name: marker,
+        type: 'workout',
+        planData: { days: [{ day: 1, exercises: [{ name: 'Squat' }] }] },
+      },
+    });
+    assert.equal(trainerSave.status, 200);
+    assert.equal(trainerSave.json.clientId, ids.client1);
+    assert.equal(trainerSave.json.trainerId, ids.trainer1);
+    assert.ok(trainerSave.json.assignmentId);
+    assignmentId = trainerSave.json.assignmentId;
+
+    const { data: assigned, error: assignedErr } = await adminDb
+      .from('assigned_plans').select('id, trainer_id, client_id, name')
+      .eq('id', assignmentId).single();
+    assert.ifError(assignedErr);
+    assert.deepEqual(assigned, {
+      id: assignmentId, trainer_id: ids.trainer1, client_id: ids.client1, name: marker,
+    });
+
+    const { data: accidentalPersonal, error: accidentalErr } = await adminDb
+      .from('user_workout_plans').select('id').eq('user_id', ids.client1).eq('name', marker);
+    assert.ifError(accidentalErr);
+    assert.equal(accidentalPersonal.length, 0, 'trainer save must not create a personal member plan');
+
+    const memberSave = await hit('POST', '/api/user-plans', {
+      token: tokens.client1,
+      body: { userId: ids.client1, name: marker, planData: { days: [] } },
+    });
+    assert.equal(memberSave.status, 200);
+    personalPlanId = memberSave.json.id;
+    assert.ok(personalPlanId);
+  });
+
+  test('unrelated trainer cannot create an assignment for the client', async () => {
+    const unauthenticated = await hit('POST', '/api/trainer/assign-plan', {
+      body: { clientId: ids.client1, name: marker, type: 'workout', planData: {} },
+    });
+    assert.equal(unauthenticated.status, 401);
+
+    const result = await hit('POST', '/api/trainer/assign-plan', {
+      token: tokens.trainer2,
+      body: { clientId: ids.client1, name: marker, type: 'workout', planData: {} },
+    });
+    assert.equal(result.status, 403);
+  });
+});

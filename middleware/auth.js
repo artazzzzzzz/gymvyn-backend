@@ -28,6 +28,7 @@ async function requireGymOwner(req, res, next) {
     .select('id')
     .eq('id', gymId)
     .eq('owner_id', req.user.id)
+    .eq('is_active', true)
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });

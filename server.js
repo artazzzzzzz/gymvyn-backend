@@ -1126,6 +1126,7 @@ async function isGymOwner(userId, gymId) {
     .select('id')
     .eq('id', gymId)
     .eq('owner_id', userId)
+    .eq('is_active', true)
     .maybeSingle();
   return !!data;
 }
@@ -1954,6 +1955,24 @@ app.post('/api/gym-members/:memberId/assign-trainer', auth, async (req, res) => 
     if (!memRow) return res.status(404).json({ message: 'Member not found' });
     if (!(await isGymOwner(req.user.id, memRow.gym_id))) {
       return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    // assigned_trainer_id is a bare users.id FK with no gym scoping of its
+    // own — without this check an owner could assign any user (a trainer at
+    // a different gym, or an unrelated account) as if trusting the client
+    // to only ever send a valid same-gym trainer id.
+    if (trainer_id) {
+      const { data: trainerRow, error: trainerLookupErr } = await supabase
+        .from('trainer_profiles')
+        .select('id')
+        .eq('user_id', trainer_id)
+        .eq('gym_id', memRow.gym_id)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (trainerLookupErr) throw trainerLookupErr;
+      if (!trainerRow) {
+        return res.status(400).json({ message: 'trainer_id must be an active trainer at this gym' });
+      }
     }
 
     // Scope to the active membership row only, not every historical row
@@ -2950,20 +2969,25 @@ app.post('/api/gym-join', auth, async (req, res) => {
     const { data: gym, error: gymErr } = await supabase
       .from('gyms')
       .select('id, name, is_active')
-      .eq('join_code', code)
+      .ilike('join_code', code)
       .eq('is_active', true)
       .maybeSingle();
     if (gymErr) throw gymErr;
 
     if (!gym) return res.status(404).json({ error: 'Invalid join code' });
 
-    // Don't downgrade an existing gym owner to gym_member.
+    // A member join code is never a way to change an owner, trainer, or
+    // staff account into a member at another gym. Derive this from the
+    // authenticated caller's server-side role, not any body field.
     const { data: existing, error: existingErr } = await supabase
       .from('users')
       .select('role')
       .eq('id', user_id)
       .maybeSingle();
     if (existingErr) throw existingErr;
+    if (!existing || !['consumer', 'gym_member'].includes(existing.role)) {
+      return res.status(403).json({ message: 'Only member accounts can join a gym with a member code' });
+    }
 
     // gym_memberships is the source of truth for "is this user a member of this
     // gym" (owner's member list, My Gym tab). Write it BEFORE users.gym_id so a
@@ -3011,8 +3035,7 @@ app.post('/api/gym-join', auth, async (req, res) => {
       if (reactivateErr) throw reactivateErr;
     }
 
-    const update = { gym_id: gym.id };
-    if (existing?.role !== 'gym_owner') update.role = 'gym_member';
+    const update = { gym_id: gym.id, role: 'gym_member' };
 
     const { error: updateErr } = await supabase
       .from('users')

@@ -326,6 +326,7 @@ router.get('/class/:classId', auth, async (req, res) => {
       .select('id')
       .eq('id', cls.gym_id)
       .eq('owner_id', userId)
+      .eq('is_active', true)
       .maybeSingle();
     if (gymErr) throw gymErr;
 
