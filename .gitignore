@@ -2,6 +2,8 @@ node_modules/
 .env
 scripts/test-ecosystem-credentials.md
 scripts/test-results-api.md
+.DS_Store
+**/.DS_Store
 # Added by code-review-graph
 .code-review-graph/
 .env.local
