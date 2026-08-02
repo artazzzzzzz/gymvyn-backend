@@ -225,7 +225,7 @@ const recomputeMealTotals = async (supabase, mealId) => {
 const insertTemplateDays = async (supabase, templateId, days) => {
   if (!days?.length) return;
   for (const day of days) {
-    const { data: dayRow } = await supabase
+    const { data: dayRow, error: dayErr } = await supabase
       .from('diet_plan_days')
       .insert({
         template_id: templateId,
@@ -238,10 +238,11 @@ const insertTemplateDays = async (supabase, templateId, days) => {
       })
       .select()
       .single();
+    if (dayErr || !dayRow) throw dayErr || new Error(`Failed to insert day ${day.day_number}`);
 
     if (day.meals?.length) {
       for (const meal of day.meals) {
-        const { data: mealRow } = await supabase
+        const { data: mealRow, error: mealErr } = await supabase
           .from('diet_plan_meals')
           .insert({
             day_id: dayRow.id,
@@ -262,6 +263,7 @@ const insertTemplateDays = async (supabase, templateId, days) => {
           })
           .select()
           .single();
+        if (mealErr || !mealRow) throw mealErr || new Error(`Failed to insert meal ${meal.meal_name}`);
 
         if (meal.foods?.length) {
           const resolvedFoods = await Promise.all(meal.foods.map(async (food) =>

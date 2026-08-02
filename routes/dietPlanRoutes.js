@@ -47,6 +47,7 @@ router.get('/templates', auth, async (req, res) => {
 router.post('/templates', auth, async (req, res) => {
   try {
     const { name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, days } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'Template name is required' });
     if (invalidTargetResponse(res, { calories_target, protein_g, carbs_g, fat_g })) return;
     const invalidDay = hasInvalidDayTarget(days);
     if (invalidDay) return invalidTargetResponse(res, invalidDay);
@@ -55,7 +56,7 @@ router.post('/templates', auth, async (req, res) => {
       .from('diet_plan_templates')
       .insert({
         trainer_id: req.user.id,
-        name,
+        name: name.trim(),
         description,
         detail_level,
         calories_target,
@@ -69,10 +70,13 @@ router.post('/templates', auth, async (req, res) => {
 
     await insertTemplateDays(supabase, template.id, days);
     const full = await fetchFullTemplate(supabase, template.id);
-    await supabase.from('diet_template_versions').insert({
-      template_id: template.id, version: 1, snapshot: full, created_by: req.user.id,
-    });
-    res.status(201).json(full);
+    if (full) {
+      const { error: versionErr } = await supabase.from('diet_template_versions').insert({
+        template_id: template.id, version: 1, snapshot: full, created_by: req.user.id,
+      });
+      if (versionErr) console.error('diet_template_versions insert failed:', versionErr.message);
+    }
+    res.status(201).json(full || { ...template, days: [] });
   } catch (err) {
     console.error('POST /api/diet-plans/templates error:', err);
     res.status(500).json({ error: err.message });

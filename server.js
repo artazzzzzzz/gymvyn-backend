@@ -254,7 +254,14 @@ app.post('/chat', auth, async (req, res) => {
     );
 
     const data = await response.json();
-    const reply = data.candidates[0].content.parts[0].text;
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!reply) {
+      const blockReason = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason;
+      const userMessage = blockReason === 'SAFETY'
+        ? "I can't respond to that. Please keep questions fitness-related."
+        : "I couldn't generate a response. Please try rephrasing your question.";
+      return res.json({ reply: userMessage });
+    }
 
     res.json({ reply });
   } catch (err) {
@@ -497,6 +504,27 @@ app.patch('/api/gyms/:gymId/settings', auth, requireGymOwner, async (req, res) =
     ALLOWED.forEach(field => {
       if (body[field] !== undefined) updateObj[field] = body[field];
     });
+
+    // Operating hours are shared by member booking and owner scheduling. Keep
+    // malformed ranges out of the database even when a non-UI client calls
+    // this endpoint directly; closed days may omit times, open days must have
+    // valid HH:MM values with open strictly before close.
+    if (updateObj.operating_hours !== undefined) {
+      const hours = updateObj.operating_hours;
+      if (!hours || typeof hours !== 'object' || Array.isArray(hours)) {
+        return res.status(400).json({ error: 'operating_hours must be an object' });
+      }
+      const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+      for (const [day, value] of Object.entries(hours)) {
+        if (!value || typeof value !== 'object') {
+          return res.status(400).json({ error: `Invalid operating hours for ${day}` });
+        }
+        if (value.closed) continue;
+        if (!timePattern.test(value.open || '') || !timePattern.test(value.close || '') || value.open >= value.close) {
+          return res.status(400).json({ error: `Open time must be before close time for ${day}` });
+        }
+      }
+    }
 
     if (Object.keys(updateObj).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
@@ -1026,6 +1054,94 @@ app.post('/api/gym-members/manual', auth, async (req, res) => {
   }
 });
 
+// ── POST /api/gym-members/invite-email  ──────────────────────────────────────
+// Unlike POST /api/gym-members/manual (profile-only row, no login), this
+// sends a real magic-link invite via Supabase auth so the member can sign
+// in themselves — mirrors the email branch of POST /api/gym-trainers/invite.
+// Supabase only confirms an invite after the recipient uses the mail link;
+// there is no server callback in this app that could later promote a pending
+// row. Create the scoped membership now, just as the phone/code flows do. It
+// still cannot be used until the invited auth account completes sign-up.
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post('/api/gym-members/invite-email', auth, async (req, res) => {
+  try {
+    const { gym_id, email, full_name, plan_name } = req.body || {};
+
+    if (!gym_id) return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    const trimmedEmail = String(email || '').trim().toLowerCase();
+    if (!trimmedEmail || !EMAIL_RE.test(trimmedEmail)) {
+      return res.status(400).json({ message: 'A valid email address is required' });
+    }
+    const trimmedName = String(full_name || '').trim() || 'Invited Member';
+
+    const { data: inviteData, error: inviteErr } = await supabase.auth.admin.inviteUserByEmail(
+      trimmedEmail,
+      { data: { full_name: trimmedName } }
+    );
+    if (inviteErr) {
+      const msg = inviteErr.message || '';
+      if (/already registered|already been registered|already exists/i.test(msg) || inviteErr.status === 422) {
+        return res.status(409).json({
+          message: 'This email already has a Gymvyn account. Share your gym join code instead, or add them by phone/name.',
+        });
+      }
+      // Do not expose a provider error verbatim to an owner. The usual local
+      // failure is an unapproved/disposable recipient domain; production also
+      // requires Supabase Auth email delivery to be configured.
+      console.error('Supabase member invite delivery error:', inviteErr.message);
+      return res.status(502).json({
+        message: 'Gymvyn could not send that email invite. Verify Supabase Auth email delivery and the recipient email domain, then try again.',
+      });
+    }
+
+    const userId = inviteData.user.id;
+
+    const { error: usersErr } = await supabase.from('users').insert({
+      id: userId,
+      full_name: trimmedName,
+      role: 'gym_member',
+      gym_id,
+      is_active: true,
+    });
+    if (usersErr) {
+      await supabase.auth.admin.deleteUser(userId);
+      throw usersErr;
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: membership, error: memErr } = await supabase
+      .from('gym_memberships')
+      .insert({
+        id: crypto.randomUUID(),
+        gym_id,
+        user_id: userId,
+        status: 'active',
+        membership_type: plan_name || null,
+        monthly_fee: 0,
+        start_date: today,
+        metadata: { full_name: trimmedName, email: trimmedEmail, is_email_invite: true },
+      })
+      .select('id')
+      .single();
+    if (memErr) {
+      await supabase.auth.admin.deleteUser(userId);
+      await supabase.from('users').delete().eq('id', userId);
+      throw memErr;
+    }
+
+    res.status(201).json({ success: true, user_id: userId, membership_id: membership.id });
+  } catch (err) {
+    console.error('POST /api/gym-members/invite-email error:', err);
+    res.status(500).json({ message: err.message || 'Failed to send invite' });
+  }
+});
+
 // ── POST /api/gym-members/import  ────────────────────────────────────────────
 // Bulk import from CSV. Each member: { full_name, phone, email, plan_name }
 // Looks up existing users by phone or email; creates pending profiles otherwise.
@@ -1297,7 +1413,9 @@ app.get('/api/gym-members', auth, async (req, res) => {
         membership_start: r.start_date || null,
         membership_end:   r.end_date   || null,
         status:           r.status     || 'active',
+        effective_status: effectiveMembershipStatus(r.status, r.end_date),
         days_until_expiry,
+        days_remaining:   daysRemaining(r.end_date),
         churn_risk:       churnMap[r.user_id] || 'low',
         joined_at:        r.users?.created_at || r.created_at || null,
       };
@@ -1389,11 +1507,31 @@ app.get('/api/gym-members/count/:gymId', auth, async (req, res) => {
 // ── Member detail helper ──────────────────────────────────────────────────────
 
 const MEMBER_DETAIL_SELECT = `
-  id, gym_id, membership_type, start_date, end_date, status,
+  id, gym_id, membership_type, start_date, end_date, status, assigned_trainer_id,
   users!gym_memberships_user_id_fkey!inner(
     id, full_name, phone, age, height, current_weight, gender, created_at
   )
 `;
+
+// Canonical membership state shown to the UI. A stored status of 'active'
+// whose end_date has already passed must display as expired even though
+// nothing flipped the status column (no cron does this — see
+// isMembershipCurrentlyActive in POST /api/checkin for the same gap).
+// Any other stored status (inactive/pending/etc.) always wins as-is.
+function effectiveMembershipStatus(status, endDate) {
+  if (status && status !== 'active') return status;
+  const isPastEnd = !!endDate && endDate < istTodayYMD();
+  return isPastEnd ? 'expired' : 'active';
+}
+
+// Days remaining until end_date, floored at 0 — never negative. Returns
+// null when there's no end_date to compare against.
+function daysRemaining(endDate) {
+  if (!endDate) return null;
+  const endMs   = new Date(`${endDate}T00:00:00+05:30`).getTime();
+  const todayMs = new Date(`${istTodayYMD()}T00:00:00+05:30`).getTime();
+  return Math.max(0, Math.ceil((endMs - todayMs) / 86400000));
+}
 
 async function buildMemberDetail(memberId) {
   // Prefer the currently active membership row; a member can accumulate
@@ -1432,7 +1570,7 @@ async function buildMemberDetail(memberId) {
   monthStart.setDate(1);
   monthStart.setHours(0, 0, 0, 0);
 
-  const [churnRes, checkinsRes, paymentsRes] = await Promise.all([
+  const [churnRes, checkinsRes, paymentsRes, assignedTrainerRes] = await Promise.all([
     supabase
       .from('churn_scores')
       .select('score, top_reasons, predicted_at')
@@ -1453,6 +1591,9 @@ async function buildMemberDetail(memberId) {
       .eq('gym_id', gymId)
       .order('paid_at', { ascending: false })
       .limit(5),
+    membership.assigned_trainer_id
+      ? supabase.from('users').select('id, full_name').eq('id', membership.assigned_trainer_id).maybeSingle()
+      : Promise.resolve({ data: null }),
   ]);
 
   // Attendance
@@ -1469,7 +1610,8 @@ async function buildMemberDetail(memberId) {
   const normScore = rawScore / 100;
   const churnRisk = normScore >= 0.7 ? 'high' : normScore >= 0.4 ? 'medium' : 'low';
 
-  // Days until expiry
+  // Days until expiry (raw, kept for backward compat — can go negative;
+  // callers should prefer days_remaining, which is floored at 0)
   const endMs           = membership.end_date ? new Date(membership.end_date).getTime() : null;
   const daysUntilExpiry = endMs != null ? Math.ceil((endMs - Date.now()) / 86400000) : null;
 
@@ -1495,8 +1637,11 @@ async function buildMemberDetail(memberId) {
     plan_type:         planTypeLabel,
     membership_start:  membership.start_date || null,
     membership_end:    membership.end_date   || null,
+    status:            membership.status     || 'active',
     membership_status: membership.status     || 'active',
+    effective_status:  effectiveMembershipStatus(membership.status, membership.end_date),
     days_until_expiry: daysUntilExpiry,
+    days_remaining:    daysRemaining(membership.end_date),
     churn_score:       rawScore,
     churn_risk:        churnRisk,
     risk_factors:      churnRow?.top_reasons || [],
@@ -1507,6 +1652,9 @@ async function buildMemberDetail(memberId) {
       last_visited: lastVisited,
     },
     payments,
+    assigned_trainer: assignedTrainerRes.data
+      ? { id: assignedTrainerRes.data.id, full_name: assignedTrainerRes.data.full_name || '' }
+      : null,
     _gymId: gymId,   // stripped by callers before sending
   };
 }
@@ -1882,6 +2030,11 @@ app.get('/api/gym-trainers/:gymId', auth, async (req, res) => {
 
       return {
         id: p.id,
+        // gym_memberships.assigned_trainer_id is a FK to users.id, not
+        // trainer_profiles.id — callers assigning a trainer to a member
+        // must use user_id, which is null for phone/manual-invited trainers
+        // who never completed signup.
+        user_id: p.user_id || null,
         full_name: p.full_name || (u ? u.full_name : 'Unknown'),
         phone: p.phone || (u ? u.phone : null),
         specializations: p.specializations || p.specialties || [],
@@ -2388,6 +2541,15 @@ function scheduleEndTime(startIso, durationMinutes) {
   return d.toISOString();
 }
 
+function parseSchedulePositiveInteger(value, fallback, field, max) {
+  if (value === undefined || value === null || value === '') return { value: fallback };
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > max) {
+    return { error: `${field} must be a positive integer no greater than ${max}` };
+  }
+  return { value: parsed };
+}
+
 // Get the Monday (local) of the week containing a given Date
 function getMondayOf(d) {
   const day = d.getDay(); // 0=Sun
@@ -2582,10 +2744,16 @@ app.post('/api/gym-schedule', auth, async (req, res) => {
     if (!isOwner) return res.status(403).json({ message: 'Forbidden' });
 
     if (!class_name?.trim()) return res.status(400).json({ message: 'class_name is required' });
-    if (!start_time)         return res.status(400).json({ message: 'start_time is required' });
+    if (!start_time || !Number.isFinite(Date.parse(start_time))) {
+      return res.status(400).json({ message: 'start_time must be a valid ISO timestamp' });
+    }
+    const parsedDuration = parseSchedulePositiveInteger(duration_minutes, 60, 'duration_minutes', 1440);
+    if (parsedDuration.error) return res.status(400).json({ message: parsedDuration.error });
+    const parsedCapacity = parseSchedulePositiveInteger(capacity, 20, 'capacity', 10000);
+    if (parsedCapacity.error) return res.status(400).json({ message: parsedCapacity.error });
 
-    const dur = Number(duration_minutes) || 60;
-    const cap = Number(capacity)         || 20;
+    const dur = parsedDuration.value;
+    const cap = parsedCapacity.value;
     const isRecurring = !!recurring && Array.isArray(recurring_days) && recurring_days.length > 0;
 
     const baseRecord = {
@@ -2699,9 +2867,76 @@ app.delete('/api/gym-schedule/:classId', auth, async (req, res) => {
   }
 });
 
+app.patch('/api/gym-schedule/:classId', auth, async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const { class_name, class_type, start_time, duration_minutes, capacity, equipment } = req.body || {};
+
+    const { data: cls, error: fetchErr } = await supabase
+      .from('class_schedule')
+      .select('gym_id, start_time')
+      .eq('id', classId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!cls) return res.status(404).json({ message: 'Class not found' });
+
+    const isOwner = await isGymOwner(req.user.id, cls.gym_id);
+    if (!isOwner) return res.status(403).json({ message: 'Forbidden' });
+
+    const updates = {};
+    if (class_name !== undefined) {
+      if (typeof class_name !== 'string' || !class_name.trim()) {
+        return res.status(400).json({ message: 'class_name is required' });
+      }
+      updates.class_name = class_name.trim();
+    }
+    if (class_type)               updates.class_type       = class_type;
+    let nextDuration;
+    if (duration_minutes != null) {
+      const parsedDuration = parseSchedulePositiveInteger(duration_minutes, null, 'duration_minutes', 1440);
+      if (parsedDuration.error) return res.status(400).json({ message: parsedDuration.error });
+      nextDuration = parsedDuration.value;
+      updates.duration_minutes = nextDuration;
+    }
+    if (capacity != null) {
+      const parsedCapacity = parseSchedulePositiveInteger(capacity, null, 'capacity', 10000);
+      if (parsedCapacity.error) return res.status(400).json({ message: parsedCapacity.error });
+      updates.capacity = parsedCapacity.value;
+    }
+    if (equipment != null)        updates.equipment        = equipment || 'No equipment';
+    if (start_time) {
+      if (!Number.isFinite(Date.parse(start_time))) {
+        return res.status(400).json({ message: 'start_time must be a valid ISO timestamp' });
+      }
+      updates.start_time = start_time;
+      updates.end_time   = scheduleEndTime(start_time, nextDuration || 60);
+    } else if (nextDuration) {
+      updates.end_time = scheduleEndTime(cls.start_time, nextDuration);
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('class_schedule')
+      .update(updates)
+      .eq('id', classId)
+      .select('id, class_name, class_type, start_time, end_time, capacity, duration_minutes, equipment')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'Class not found after update' });
+
+    res.json({ success: true, class: data });
+  } catch (err) {
+    console.error('PATCH /api/gym-schedule/:classId error:', err);
+    res.status(500).json({ message: err.message || 'Failed to update class' });
+  }
+});
+
 // ── Announcements ─────────────────────────────────────────────────────────────
 
-const VALID_PRIORITIES = ['normal', 'important', 'urgent'];
+const VALID_PRIORITIES = ['low', 'normal', 'high', 'urgent']; // matches live announcements_priority_check
 
 app.get('/api/gym-announcements/:gymId', auth, async (req, res) => {
   try {
@@ -3117,6 +3352,15 @@ function todayMidnightIso() {
   return istDateStartIso();
 }
 
+// A membership's `status` column can go stale (no job flips it the instant
+// end_date passes), so "currently active" must be derived from both the
+// stored status AND the date range, not the status column alone.
+function isMembershipCurrentlyActive(mem) {
+  if (!mem || mem.status !== 'active') return false;
+  if (mem.end_date && mem.end_date < istTodayYMD()) return false;
+  return true;
+}
+
 app.post('/api/checkin', auth, async (req, res) => {
   try {
     let { gym_id, user_id, member_id, method, qr_payload } = req.body;
@@ -3154,24 +3398,29 @@ app.post('/api/checkin', auth, async (req, res) => {
     if (user_id) {
       const { data: mem, error } = await supabase
         .from('gym_memberships')
-        .select('id, users!gym_memberships_user_id_fkey(full_name)')
+        .select('id, status, end_date, users!gym_memberships_user_id_fkey(full_name)')
         .eq('user_id', user_id)
         .eq('gym_id', gym_id)
-        .eq('status', 'active')
         .maybeSingle();
       if (error) throw error;
-      if (!mem) return res.status(404).json({ error: 'Active membership not found for user' });
+      if (!mem) return res.status(404).json({ error: 'Membership not found' });
+      if (!isMembershipCurrentlyActive(mem)) {
+        return res.status(403).json({ error: 'Membership is not active', membership_status: mem.status, end_date: mem.end_date });
+      }
       resolvedMemberId = mem.id;
       if (mem.users) fullName = mem.users.full_name;
     } else if (member_id) {
       const { data: mem, error } = await supabase
         .from('gym_memberships')
-        .select('user_id, users!gym_memberships_user_id_fkey(full_name)')
+        .select('user_id, status, end_date, users!gym_memberships_user_id_fkey(full_name)')
         .eq('id', member_id)
         .eq('gym_id', gym_id)
         .maybeSingle();
       if (error) throw error;
       if (!mem) return res.status(404).json({ error: 'Membership not found' });
+      if (!isMembershipCurrentlyActive(mem)) {
+        return res.status(403).json({ error: 'Membership is not active', membership_status: mem.status, end_date: mem.end_date });
+      }
       resolvedUserId = mem.user_id;
       if (mem.users) fullName = mem.users.full_name;
     } else {
@@ -4630,6 +4879,22 @@ Return ONLY a JSON object with this exact structure — no markdown, no explanat
       throw new Error(`AI returned an incomplete plan (${planData.days?.length || 0} of 7 days) — please try again.`);
     }
 
+    // Day count alone isn't enough -- DeepSeek has also been observed to
+    // return all 7 day entries but drop individual meals (e.g. no snack) or
+    // return a meal with an empty items array. The Diet screen assumes every
+    // day has all 4 meal types with at least one item, so validate that
+    // shape here too rather than saving a plan with silent holes in it.
+    const REQUIRED_MEAL_TYPES = ['breakfast', 'lunch', 'snack', 'dinner'];
+    const incompleteDay = planData.days.find(day => {
+      const mealTypesPresent = new Set((day.meals || []).map(m => m.meal_type));
+      const hasAllMealTypes = REQUIRED_MEAL_TYPES.every(mt => mealTypesPresent.has(mt));
+      const everyMealHasItems = (day.meals || []).every(m => Array.isArray(m.items) && m.items.length > 0);
+      return !hasAllMealTypes || !everyMealHasItems;
+    });
+    if (incompleteDay) {
+      throw new Error(`AI returned a plan with missing meals for ${incompleteDay.day_name || `day ${incompleteDay.day}`} — please try again.`);
+    }
+
     // Insert the new plan BEFORE deactivating the old one — if generation or
     // insert fails, the user must keep their existing active plan rather than
     // being left with none (previously deactivated-then-inserted, so a failed
@@ -5125,10 +5390,10 @@ app.get('/api/users/:userId', auth, async (req, res) => {
     }
     const { data, error } = await supabase
       .from('users')
-      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, role, gym_id, created_at')
+      .select('id, full_name, age, gender, city, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
       .eq('id', userId)
       .maybeSingle();
-      
+
     if (error) throw error;
     if (!data) return res.status(404).json({ message: 'User not found' });
     res.json(data);
@@ -5147,7 +5412,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
     const body = req.body;
     
     const allowed = [
-      'full_name', 'age', 'gender', 'goal',
+      'full_name', 'age', 'gender', 'city', 'goal',
       'experience', 'equipment', 'injuries',
       'training_days', 'current_weight', 'height',
       'target_weight', 'activity_level', 'phone',
@@ -5180,7 +5445,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
     
     const { data: updatedRow, error: fetchErr } = await supabase
       .from('users')
-      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, role, gym_id, created_at')
+      .select('id, full_name, age, gender, city, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
       .eq('id', userId)
       .maybeSingle();
       

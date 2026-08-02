@@ -56,6 +56,15 @@ async function hit(method, urlPath, { token, body } = {}) {
   return r.status;
 }
 
+async function hitJson(method, urlPath, { token, body } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const init = { method, headers };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const response = await fetch(BASE + urlPath, init);
+  return { status: response.status, body: await response.json().catch(() => null) };
+}
+
 // ── Setup / Teardown ───────────────────────────────────────────────────────
 
 before(async () => {
@@ -286,6 +295,40 @@ describe('Batch 12 — legacy progress-photos (self-scoped) GET /progress-photos
   });
   test('correct user → 200', async () => {
     assert.equal(await hit('GET', `/progress-photos/${ids.owner}`, { token: tokens.owner }), 200);
+  });
+});
+
+// ── FINAL DEFECT REGRESSIONS — schedule + locker boundary validation ───────
+
+describe('Final defects — live validation boundaries', () => {
+  test('DEF-030 rejects a negative class capacity without mutating the class', async () => {
+    const schedule = await hitJson('GET', `/api/gym-schedule/${GYM_ID}?week_start=2026-07-27`, {
+      token: tokens.owner,
+    });
+    assert.equal(schedule.status, 200);
+    const gymClass = schedule.body.days.flatMap(day => day.classes || [])[0];
+    assert.ok(gymClass?.id, 'seeded class is required');
+    assert.equal(
+      await hit('PATCH', `/api/gym-schedule/${gymClass.id}`, {
+        token: tokens.owner,
+        body: { capacity: -1 },
+      }),
+      400
+    );
+  });
+
+  test('DEF-040 rejects a stored-active membership whose end_date has passed', async () => {
+    const lockers = await hitJson('GET', '/api/lockers', { token: tokens.owner });
+    assert.equal(lockers.status, 200);
+    const available = lockers.body.find(locker => locker.status === 'available');
+    assert.ok(available?.id, 'an available seeded locker is required');
+    assert.equal(
+      await hit('POST', `/api/lockers/${available.id}/assign`, {
+        token: tokens.owner,
+        body: { member_id: ids.member, duration_days: 30 },
+      }),
+      400
+    );
   });
 });
 

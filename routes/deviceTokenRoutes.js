@@ -24,14 +24,27 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ error: 'token is required' });
     }
 
-    // Upsert on token, not (user_id, token) — a token identifies one
-    // specific app install, so re-registering under a different user
-    // (device shared / re-logged-in) must move the existing row, not
-    // create a duplicate.
+    const trimmedToken = token.trim();
+
+    // The unique constraint is on token, not (user_id, platform) — a token
+    // identifies one specific app install, so re-registering under a
+    // different user (device shared / re-logged-in) must move the existing
+    // row, not create a duplicate. But an FCM/APNs token refresh mints a
+    // brand-new token value for the *same* install, which wouldn't conflict
+    // on upsert — so first drop this user's other rows for the platform
+    // (their old, now-invalid tokens) before writing the new one.
+    const { error: cleanupError } = await supabase
+      .from('device_tokens')
+      .delete()
+      .eq('user_id', userId)
+      .eq('platform', platform)
+      .neq('token', trimmedToken);
+    if (cleanupError) throw cleanupError;
+
     const { error } = await supabase
       .from('device_tokens')
       .upsert(
-        { user_id: userId, platform, token: token.trim(), updated_at: new Date().toISOString() },
+        { user_id: userId, platform, token: trimmedToken, updated_at: new Date().toISOString() },
         { onConflict: 'token' }
       );
     if (error) throw error;
