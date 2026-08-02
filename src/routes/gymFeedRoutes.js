@@ -24,6 +24,61 @@ async function auth(req, res, next) {
   });
 }
 
+// Verifies the calling user is actually a member of :gymId before any read/write.
+// Must run after the local `auth` wrapper (which attaches req.user.role).
+async function requireGymMembership(req, res, next) {
+  const gymId = req.params.gymId;
+  if (!gymId) return res.status(400).json({ error: 'gymId param required' });
+
+  const { id: userId, role } = req.user;
+  let allowed = false;
+
+  try {
+    if (role === 'gym_owner') {
+      const { data } = await supabase
+        .from('gyms')
+        .select('id')
+        .eq('id', gymId)
+        .eq('owner_id', userId)
+        .maybeSingle();
+      allowed = !!data;
+    } else if (role === 'staff') {
+      const { data } = await supabase
+        .from('gym_staff')
+        .select('id')
+        .eq('gym_id', gymId)
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .maybeSingle();
+      allowed = !!data;
+    } else if (role === 'trainer') {
+      const { data } = await supabase
+        .from('trainer_profiles')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('gym_id', gymId)
+        .maybeSingle();
+      allowed = !!data;
+    } else {
+      // consumer (default)
+      const { data } = await supabase
+        .from('gym_memberships')
+        .select('id')
+        .eq('gym_id', gymId)
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+      allowed = !!data;
+    }
+  } catch (err) {
+    console.error('requireGymMembership error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  if (!allowed) return res.status(403).json({ error: 'Not a member of this gym' });
+  next();
+}
+
 const VALID_POST_TYPES = ['announcement', 'achievement', 'tip', 'general'];
 
 function allowedPostTypes(role) {
@@ -37,7 +92,7 @@ function allowedPostTypes(role) {
 
 // ── GET /:gymId/posts ─────────────────────────────────────────────────────────
 
-router.get('/:gymId/posts', auth, async (req, res) => {
+router.get('/:gymId/posts', auth, requireGymMembership, async (req, res) => {
   try {
     const { gymId } = req.params;
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
@@ -114,7 +169,7 @@ router.get('/:gymId/posts', auth, async (req, res) => {
 
 // ── POST /:gymId/posts ────────────────────────────────────────────────────────
 
-router.post('/:gymId/posts', auth, async (req, res) => {
+router.post('/:gymId/posts', auth, requireGymMembership, async (req, res) => {
   try {
     const { gymId } = req.params;
     let { post_type, title, content, image_url } = req.body;
@@ -125,19 +180,6 @@ router.post('/:gymId/posts', auth, async (req, res) => {
     }
 
     const role = req.user.role;
-
-    // Staff: verify gym_staff row exists
-    if (role === 'staff') {
-      const { data: staffRow } = await supabase
-        .from('gym_staff')
-        .select('id')
-        .eq('gym_id', gymId)
-        .eq('user_id', req.user.id)
-        .eq('is_active', true)
-        .maybeSingle();
-      if (!staffRow) return res.status(403).json({ error: 'Not a staff member of this gym' });
-    }
-
     const allowed = allowedPostTypes(role);
     if (!allowed.includes(post_type)) {
       return res.status(403).json({ error: `Your role (${role}) cannot create post_type '${post_type}'` });
@@ -267,7 +309,7 @@ router.patch('/:gymId/posts/:postId/pin', auth, async (req, res) => {
 
 // ── POST /:gymId/posts/:postId/like ──────────────────────────────────────────
 
-router.post('/:gymId/posts/:postId/like', auth, async (req, res) => {
+router.post('/:gymId/posts/:postId/like', auth, requireGymMembership, async (req, res) => {
   try {
     const { postId } = req.params;
 
@@ -298,7 +340,7 @@ router.post('/:gymId/posts/:postId/like', auth, async (req, res) => {
 
 // ── GET /:gymId/posts/:postId/comments ───────────────────────────────────────
 
-router.get('/:gymId/posts/:postId/comments', auth, async (req, res) => {
+router.get('/:gymId/posts/:postId/comments', auth, requireGymMembership, async (req, res) => {
   try {
     const { postId } = req.params;
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
@@ -334,7 +376,7 @@ router.get('/:gymId/posts/:postId/comments', auth, async (req, res) => {
 
 // ── POST /:gymId/posts/:postId/comments ──────────────────────────────────────
 
-router.post('/:gymId/posts/:postId/comments', auth, async (req, res) => {
+router.post('/:gymId/posts/:postId/comments', auth, requireGymMembership, async (req, res) => {
   try {
     const { gymId, postId } = req.params;
     const { content } = req.body;
