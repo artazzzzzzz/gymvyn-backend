@@ -2,6 +2,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { deactivateOtherGymMemberships } = require('../src/utils/relationshipAuth');
 const { auth } = require('../middleware/auth');
+const { ownerOnly, gymIdFromQuery } = require('../middleware/ownerScope');
 
 const router = express.Router();
 
@@ -10,22 +11,36 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ownerOnly (from middleware/ownerScope) requires req.profile.role.
+async function withProfile(req, res, next) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('role')
+    .eq('id', req.user.id)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: 'Failed to load user profile' });
+  if (!data)  return res.status(401).json({ error: 'User profile not found' });
+
+  req.profile = data;
+  next();
+}
+
 // GET /api/gym/join-code — gym owner gets their gym's join code
-router.get('/join-code', auth, async (req, res) => {
+router.get('/join-code', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('gyms')
       .select('join_code')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
+      .eq('id', req.gymId)
       .maybeSingle();
 
     if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'No gym found for this owner' });
+    if (!data) return res.status(404).json({ error: 'Gym not found' });
 
     if (!data.join_code) {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-      await supabase.from('gyms').update({ join_code: code }).eq('owner_id', req.user.id);
+      await supabase.from('gyms').update({ join_code: code }).eq('id', req.gymId);
       data.join_code = code;
     }
 
@@ -37,17 +52,16 @@ router.get('/join-code', auth, async (req, res) => {
 });
 
 // GET /api/gym/my-gym-code — gym owner gets join code + gym info
-router.get('/my-gym-code', auth, async (req, res) => {
+router.get('/my-gym-code', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('gyms')
       .select('id, name, join_code')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
+      .eq('id', req.gymId)
       .maybeSingle();
 
     if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'No gym found for this owner' });
+    if (!data) return res.status(404).json({ error: 'Gym not found' });
 
     if (!data.join_code) {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -160,17 +174,16 @@ router.post('/join', auth, async (req, res) => {
 // stays NULL (pending_gym_id holds the target) until the owner accepts here.
 
 // GET /api/gym/trainer-join-code — gym owner gets/generates the trainer code
-router.get('/trainer-join-code', auth, async (req, res) => {
+router.get('/trainer-join-code', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('gyms')
       .select('id, trainer_join_code')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
+      .eq('id', req.gymId)
       .maybeSingle();
 
     if (error) throw error;
-    if (!data) return res.status(404).json({ error: 'No gym found for this owner' });
+    if (!data) return res.status(404).json({ error: 'Gym not found' });
 
     if (!data.trainer_join_code) {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -186,21 +199,12 @@ router.get('/trainer-join-code', auth, async (req, res) => {
 });
 
 // GET /api/gym/trainer-join-requests — gym owner lists pending trainer requests
-router.get('/trainer-join-requests', auth, async (req, res) => {
+router.get('/trainer-join-requests', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
-    const { data: gym, error: gymErr } = await supabase
-      .from('gyms')
-      .select('id')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
-      .maybeSingle();
-    if (gymErr) throw gymErr;
-    if (!gym) return res.status(404).json({ error: 'No gym found for this owner' });
-
     const { data: pending, error: pendingErr } = await supabase
       .from('trainer_profiles')
       .select('id, user_id, bio, specializations, experience_years, updated_at')
-      .eq('pending_gym_id', gym.id);
+      .eq('pending_gym_id', req.gymId);
     if (pendingErr) throw pendingErr;
 
     const userIds = (pending || []).map(p => p.user_id).filter(Boolean);
@@ -233,18 +237,16 @@ router.get('/trainer-join-requests', auth, async (req, res) => {
 });
 
 // PATCH /api/gym/trainer-join-requests/:trainerProfileId/accept — approve
-router.patch('/trainer-join-requests/:trainerProfileId/accept', auth, async (req, res) => {
+router.patch('/trainer-join-requests/:trainerProfileId/accept', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
     const { trainerProfileId } = req.params;
 
     const { data: gym, error: gymErr } = await supabase
       .from('gyms')
-      .select('id, name')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
+      .select('name')
+      .eq('id', req.gymId)
       .maybeSingle();
     if (gymErr) throw gymErr;
-    if (!gym) return res.status(404).json({ error: 'No gym found for this owner' });
 
     const { data: tp, error: tpErr } = await supabase
       .from('trainer_profiles')
@@ -255,7 +257,7 @@ router.patch('/trainer-join-requests/:trainerProfileId/accept', auth, async (req
     if (!tp) return res.status(404).json({ error: 'Request not found' });
 
     // Ownership check: the request must actually target this owner's gym.
-    if (tp.pending_gym_id !== gym.id) {
+    if (tp.pending_gym_id !== req.gymId) {
       return res.status(404).json({ error: 'Request not found' });
     }
 
@@ -267,11 +269,11 @@ router.patch('/trainer-join-requests/:trainerProfileId/accept', auth, async (req
 
     const { error: updateErr } = await supabase
       .from('trainer_profiles')
-      .update({ gym_id: gym.id, pending_gym_id: null, status: 'active', updated_at: new Date().toISOString() })
+      .update({ gym_id: req.gymId, pending_gym_id: null, status: 'active', updated_at: new Date().toISOString() })
       .eq('id', trainerProfileId);
     if (updateErr) throw updateErr;
 
-    res.json({ success: true, gym_id: gym.id, gym_name: gym.name });
+    res.json({ success: true, gym_id: req.gymId, gym_name: gym?.name || null });
   } catch (err) {
     console.error('PATCH /api/gym/trainer-join-requests/:trainerProfileId/accept error:', err);
     res.status(500).json({ error: err.message });
@@ -279,18 +281,9 @@ router.patch('/trainer-join-requests/:trainerProfileId/accept', auth, async (req
 });
 
 // DELETE /api/gym/trainer-join-requests/:trainerProfileId — decline
-router.delete('/trainer-join-requests/:trainerProfileId', auth, async (req, res) => {
+router.delete('/trainer-join-requests/:trainerProfileId', auth, withProfile, ownerOnly(gymIdFromQuery), async (req, res) => {
   try {
     const { trainerProfileId } = req.params;
-
-    const { data: gym, error: gymErr } = await supabase
-      .from('gyms')
-      .select('id')
-      .eq('owner_id', req.user.id)
-      .eq('is_active', true)
-      .maybeSingle();
-    if (gymErr) throw gymErr;
-    if (!gym) return res.status(404).json({ error: 'No gym found for this owner' });
 
     const { data: tp, error: tpErr } = await supabase
       .from('trainer_profiles')
@@ -298,7 +291,7 @@ router.delete('/trainer-join-requests/:trainerProfileId', auth, async (req, res)
       .eq('id', trainerProfileId)
       .maybeSingle();
     if (tpErr) throw tpErr;
-    if (!tp || tp.pending_gym_id !== gym.id) {
+    if (!tp || tp.pending_gym_id !== req.gymId) {
       return res.status(404).json({ error: 'Request not found' });
     }
 

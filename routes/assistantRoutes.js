@@ -1,6 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
+const { ownerOnly, gymIdFromQuery, gymIdFromBody } = require('../middleware/ownerScope');
 const { aiRateLimit } = require('../src/middleware/aiRateLimit');
 
 // Returns 404 (not found) when the flag is off — keeps the feature completely dark.
@@ -24,35 +25,40 @@ const supabase = createClient(
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-// Resolves the active gym from the token — never from a client-supplied value.
-async function ownerOnly(req, res, next) {
-  const { data: profile, error: pErr } = await supabase
+// ownerOnly (from middleware/ownerScope) requires req.profile.role.
+async function withProfile(req, res, next) {
+  const { data, error } = await supabase
     .from('users')
     .select('role')
     .eq('id', req.user.id)
     .maybeSingle();
 
-  if (pErr) return res.status(500).json({ error: 'Failed to load profile' });
-  if (!profile || profile.role !== 'gym_owner') {
-    return res.status(403).json({ error: 'Gym owner access required' });
-  }
+  if (error) return res.status(500).json({ error: 'Failed to load user profile' });
+  if (!data)  return res.status(401).json({ error: 'User profile not found' });
 
-  const { data: gym, error: gErr } = await supabase
-    .from('gyms')
-    .select('id, name')
-    .eq('owner_id', req.user.id)
-    .eq('is_active', true)
-    .maybeSingle();
-
-  if (gErr) return res.status(500).json({ error: 'Failed to resolve gym' });
-  if (!gym) return res.status(404).json({ error: 'No active gym found for this owner' });
-
-  req.gymId = gym.id;
-  req.gymName = gym.name;
+  req.profile = data;
   next();
 }
 
-const guard = [auth, ownerOnly, requireAssistantEnabled, aiRateLimit];
+// Fetches the gym name for req.gymId — must run after ownerOnly. Only
+// POST /message needs it (embedded in the AI system prompt).
+async function fetchGymName(req, res, next) {
+  const { data, error } = await supabase
+    .from('gyms')
+    .select('name')
+    .eq('id', req.gymId)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: 'Failed to resolve gym' });
+  req.gymName = data?.name || null;
+  next();
+}
+
+// gym_id is now client-supplied (query param or body field, per route) but
+// ownership-verified via the shared requireGymOwner check inside ownerOnly.
+function guard(getGymId) {
+  return [auth, withProfile, ownerOnly(getGymId), requireAssistantEnabled, aiRateLimit];
+}
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
@@ -914,7 +920,7 @@ async function computeAttentionItems(gymId) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // POST /api/assistant/message
-router.post('/message', ...guard, async (req, res) => {
+router.post('/message', ...guard(gymIdFromBody), fetchGymName, async (req, res) => {
   const start = Date.now();
   const { conversationId, message } = req.body || {};
 
@@ -1067,7 +1073,7 @@ router.post('/message', ...guard, async (req, res) => {
 });
 
 // GET /api/assistant/attention
-router.get('/attention', ...guard, async (req, res) => {
+router.get('/attention', ...guard(gymIdFromQuery), async (req, res) => {
   try {
     const items = await computeAttentionItems(req.gymId);
     res.json({ items });
@@ -1078,7 +1084,7 @@ router.get('/attention', ...guard, async (req, res) => {
 });
 
 // GET /api/assistant/attention/badge — fast count for FAB badge polling
-router.get('/attention/badge', auth, ownerOnly, requireAssistantEnabled, async (req, res) => {
+router.get('/attention/badge', auth, withProfile, ownerOnly(gymIdFromQuery), requireAssistantEnabled, async (req, res) => {
   try {
     const today   = new Date().toISOString().slice(0, 10);
     const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -1103,7 +1109,7 @@ router.get('/attention/badge', auth, ownerOnly, requireAssistantEnabled, async (
 });
 
 // GET /api/assistant/conversations
-router.get('/conversations', ...guard, async (req, res) => {
+router.get('/conversations', ...guard(gymIdFromQuery), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('assistant_conversations')
@@ -1121,7 +1127,7 @@ router.get('/conversations', ...guard, async (req, res) => {
 });
 
 // GET /api/assistant/conversations/:id
-router.get('/conversations/:id', ...guard, async (req, res) => {
+router.get('/conversations/:id', ...guard(gymIdFromQuery), async (req, res) => {
   try {
     const { data: conv, error: cErr } = await supabase
       .from('assistant_conversations')
@@ -1150,7 +1156,7 @@ router.get('/conversations/:id', ...guard, async (req, res) => {
 });
 
 // GET /api/assistant/settings
-router.get('/settings', ...guard, async (req, res) => {
+router.get('/settings', ...guard(gymIdFromQuery), async (req, res) => {
   try {
     const settings = await getSettings(req.gymId);
     res.json(settings);
@@ -1161,7 +1167,7 @@ router.get('/settings', ...guard, async (req, res) => {
 });
 
 // PATCH /api/assistant/settings
-router.patch('/settings', ...guard, async (req, res) => {
+router.patch('/settings', ...guard(gymIdFromBody), async (req, res) => {
   const { revenue_metric } = req.body || {};
   const VALID = ['membership_only', 'all_income'];
 
@@ -1189,7 +1195,7 @@ router.patch('/settings', ...guard, async (req, res) => {
 });
 
 // PATCH /api/assistant/action-log/:id  — update status after confirm/cancel/execute
-router.patch('/action-log/:id', ...guard, async (req, res) => {
+router.patch('/action-log/:id', ...guard(gymIdFromQuery), async (req, res) => {
   const { status } = req.body || {};
   const VALID_STATUS = ['confirmed', 'executed', 'cancelled'];
 
