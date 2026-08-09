@@ -5390,7 +5390,7 @@ app.get('/api/users/:userId', auth, async (req, res) => {
     }
     const { data, error } = await supabase
       .from('users')
-      .select('id, full_name, age, gender, city, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
+      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
       .eq('id', userId)
       .maybeSingle();
 
@@ -5412,7 +5412,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
     const body = req.body;
     
     const allowed = [
-      'full_name', 'age', 'gender', 'city', 'goal',
+      'full_name', 'age', 'gender', 'goal',
       'experience', 'equipment', 'injuries',
       'training_days', 'current_weight', 'height',
       'target_weight', 'activity_level', 'phone',
@@ -5445,7 +5445,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
     
     const { data: updatedRow, error: fetchErr } = await supabase
       .from('users')
-      .select('id, full_name, age, gender, city, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
+      .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
       .eq('id', userId)
       .maybeSingle();
       
