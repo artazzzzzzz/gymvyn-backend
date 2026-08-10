@@ -349,13 +349,27 @@ app.post('/api/gyms', auth, async (req, res) => {
       fullName = authUserData?.user_metadata?.full_name || null;
     } catch (_) { /* non-fatal */ }
 
+    // Only write gym_id when the column is currently NULL (i.e. this is the owner's
+    // first gym).  Overwriting it on every creation was the root cause of the
+    // multi-gym staleness bug: GymMembers/GymPayments and other pages were reading
+    // this column instead of ActiveGymContext and silently saw the wrong gym after
+    // any subsequent gym was created.  For first-time owners the NULL → id write is
+    // still required so useAuth.jsx's onboarding-completion check (!data?.gym_id)
+    // can flip from false to true and let them past the /gym-onboarding redirect.
+    const { data: existingUserRow } = await supabase
+      .from('users')
+      .select('gym_id')
+      .eq('id', user_id)
+      .maybeSingle();
+    const isFirstGym = !existingUserRow?.gym_id;
+
     const { error: updateErr } = await supabase
       .from('users')
       .upsert(
         {
           id: user_id,
           role: 'gym_owner',
-          gym_id: createdGymRow.id,
+          ...(isFirstGym ? { gym_id: createdGymRow.id } : {}),
           ...(fullName ? { full_name: fullName } : {}),
         },
         { onConflict: 'id', ignoreDuplicates: false }
