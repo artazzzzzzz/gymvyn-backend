@@ -1,5 +1,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
 const { auth } = require('../middleware/auth');
 const { getOrCreateConversationIfAllowed } = require('../src/utils/canMessage');
 const { sendMessageAtomically } = require('../src/services/chatService');
@@ -17,6 +19,14 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const photoUpload = multer({ storage: multer.memoryStorage() });
 
 // Checks for an active trainer_clients row linking the two ids in this
 // exact direction (trainerId is the trainer, clientId is the client).
@@ -141,6 +151,43 @@ router.patch('/profile/:userId', auth, async (req, res) => {
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/trainer/profile/:userId/photo — upload trainer avatar
+router.post('/profile/:userId/photo', auth, photoUpload.single('photo'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (req.user.id !== userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream(
+        {
+          folder:         'gymvyn/trainers',
+          public_id:      `trainer-avatar-${userId}`,
+          overwrite:      true,
+          transformation: [{ width: 400, height: 400, crop: 'fill', gravity: 'center' }],
+        },
+        (error, result) => { if (error) reject(error); else resolve(result); }
+      ).end(req.file.buffer);
+    });
+
+    const { error: dbErr } = await supabase
+      .from('trainer_profiles')
+      .update({ profile_photo_url: result.secure_url })
+      .eq('user_id', userId);
+
+    if (dbErr) throw dbErr;
+
+    res.json({ photo_url: result.secure_url });
+  } catch (err) {
+    console.error('POST /api/trainer/profile/:userId/photo error:', err);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
