@@ -184,12 +184,36 @@ async function createVersion(listing, template) {
   if (error) throw error;
 }
 
+// Merges avg_rating/review_count onto public listing objects. Deliberately
+// not a DB view or a PostgREST embed: review volume per listing is tiny, so
+// aggregating client-side over plans_reviews (status='visible' only, same
+// visibility rule as GET /listings/:id/reviews) avoids a migration for what
+// is, for now, a handful of rows. avg_rating is null / review_count is 0
+// when a listing has no visible reviews yet -- the frontend treats that as
+// "don't show a rating", never as a 0-star rating.
+async function attachReviewStats(listings) {
+  const ids = listings.map((listing) => listing.id);
+  if (!ids.length) return listings;
+  const { data, error } = await supabase.from('plans_reviews').select('listing_id, rating').eq('status', 'visible').in('listing_id', ids);
+  if (error) throw error;
+  const stats = {};
+  for (const row of data || []) {
+    const bucket = stats[row.listing_id] || (stats[row.listing_id] = { sum: 0, count: 0 });
+    bucket.sum += row.rating;
+    bucket.count += 1;
+  }
+  return listings.map((listing) => {
+    const bucket = stats[listing.id];
+    return { ...listing, avg_rating: bucket ? Math.round((bucket.sum / bucket.count) * 10) / 10 : null, review_count: bucket ? bucket.count : 0 };
+  });
+}
+
 // Public browse. No private trainer, moderation, or payment fields are selected.
 router.get('/listings', async (req, res) => {
   try {
     const { data, error } = await supabase.from('plans_listings').select(PUBLIC_FIELDS).eq('status', 'published').order('published_at', { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+    res.json(await attachReviewStats(data || []));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -198,7 +222,8 @@ router.get('/listings/:slug', async (req, res) => {
     const { data, error } = await supabase.from('plans_listings').select(PUBLIC_FIELDS).eq('slug', req.params.slug).eq('status', 'published').maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Listing not found' });
-    res.json(data);
+    const [withStats] = await attachReviewStats([data]);
+    res.json(withStats);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -219,7 +244,7 @@ router.get('/trainers/:handle', async (req, res) => {
       .select(PUBLIC_FIELDS).eq('trainer_id', profile.user_id).eq('status', 'published').order('published_at', { ascending: false });
     if (listingsError) throw listingsError;
     if (!listings || listings.length === 0) return res.status(404).json({ error: 'Trainer not found' });
-    res.json({ handle: profile.handle, full_name: profile.trainer?.full_name || null, listings });
+    res.json({ handle: profile.handle, full_name: profile.trainer?.full_name || null, listings: await attachReviewStats(listings) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -440,6 +465,22 @@ router.post('/purchases/:purchaseId/review', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Lets the buyer's own client know whether they've already reviewed a
+// purchase (and what they wrote) without exposing any buyer_id through the
+// public /listings/:id/reviews list. Symmetric with the POST above: same
+// ownership scoping, same table.
+router.get('/purchases/:purchaseId/review', auth, async (req, res) => {
+  try {
+    const { data: purchase, error: purchaseError } = await supabase.from('plans_purchases').select('id').eq('id', req.params.purchaseId).eq('buyer_id', req.user.id).maybeSingle();
+    if (purchaseError) throw purchaseError;
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found' });
+    const { data, error } = await supabase.from('plans_reviews').select('id, listing_id, purchase_id, rating, review_text, status, created_at').eq('purchase_id', purchase.id).eq('buyer_id', req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'No review yet' });
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Moderation: suspend (recoverable -- e.g. a listing under review) and remove
 // (terminal) both write the matching plans_listings.*_at timestamp plus an
 // optional moderation_reason, columns the Phase 1 schema already reserved for
@@ -594,4 +635,4 @@ async function deliverPurchase(purchaseId) {
 }
 
 module.exports = router;
-module.exports._private = { slugify, listingInput, purchaseInput, commissionMinor, plansPaymentsEnabled, razorpaySettings, razorpayReceipt, createRazorpayOrder, paymentOrderResponse, storeProviderOrder, failPendingPurchase, deliverPurchase, generateHandle, validHandleFormat, COMMISSION_BPS, PUBLIC_FIELDS };
+module.exports._private = { slugify, listingInput, purchaseInput, commissionMinor, plansPaymentsEnabled, razorpaySettings, razorpayReceipt, createRazorpayOrder, paymentOrderResponse, storeProviderOrder, failPendingPurchase, deliverPurchase, generateHandle, validHandleFormat, attachReviewStats, COMMISSION_BPS, PUBLIC_FIELDS };
