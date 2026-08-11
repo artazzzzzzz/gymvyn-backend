@@ -282,6 +282,25 @@ router.get('/trainer/listings', auth, requireTrainerRole, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// A trainer's own sales -- every purchase across every one of their
+// listings, regardless of status, so they can see pending ones too, not
+// just delivered. Buyer full_name only, no email: unlike the admin
+// endpoint (which needs email to do manual payment verification), a
+// trainer has no operational need for a buyer's contact details, only
+// who bought what. Ownership is the .eq('trainer_id', req.user.id) below
+// -- there is no :id param, so this can never return another trainer's
+// sales.
+router.get('/trainer/sales', auth, requireTrainerRole, async (req, res) => {
+  try {
+    if (!(await requireActiveTrainer(req.user.id))) return res.status(403).json({ error: 'Active trainer profile required' });
+    const { data, error } = await supabase.from('plans_purchases')
+      .select('id, listing_id, currency, final_price_minor, commission_minor, status, created_at, delivered_at, listing:plans_listings(title), buyer:users!plans_purchases_buyer_id_fkey(full_name)')
+      .eq('trainer_id', req.user.id).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Trainer-owned source templates for Gymvyn Plans seller tooling. Keep this
 // deliberately small: it is only used to select a listing source template.
 router.get('/trainer/templates', auth, requireTrainerRole, async (req, res) => {
@@ -513,6 +532,52 @@ router.post('/admin/listings/:id/remove', auth, requireAdminPlans, async (req, r
     if (listingError) throw listingError;
     if (!listing) return res.status(404).json({ error: 'Listing not found' });
     res.json(await moderateListing(listing.id, { status: 'removed', timestampColumn: 'removed_at', reason }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Review moderation, same shape as listing moderation above: hide is
+// recoverable (e.g. a review under dispute), remove is terminal. A
+// hidden/removed review already drops out of the public
+// GET /listings/:id/reviews (status = 'visible' filter), so no separate
+// unpublish step is needed here either.
+async function moderateReview(id, { status, timestampColumn, reason }) {
+  const { data, error } = await supabase.from('plans_reviews')
+    .update({ status, [timestampColumn]: new Date().toISOString(), moderation_reason: reason, updated_at: new Date().toISOString() })
+    .eq('id', id).select('*').maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+router.get('/admin/reviews', auth, requireAdminPlans, async (req, res) => {
+  try {
+    let query = supabase.from('plans_reviews')
+      .select('id, listing_id, purchase_id, rating, review_text, status, created_at, listing:plans_listings(title), buyer:users!plans_reviews_buyer_id_fkey(full_name)')
+      .order('created_at', { ascending: false });
+    if (req.query.status) query = query.eq('status', req.query.status);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/admin/reviews/:id/hide', auth, requireAdminPlans, async (req, res) => {
+  try {
+    const reason = req.body?.reason ? String(req.body.reason).trim().slice(0, 500) : null;
+    const { data: review, error: reviewError } = await supabase.from('plans_reviews').select('id, status').eq('id', req.params.id).maybeSingle();
+    if (reviewError) throw reviewError;
+    if (!review) return res.status(404).json({ error: 'Review not found' });
+    if (review.status === 'removed') return res.status(409).json({ error: 'Review has already been removed' });
+    res.json(await moderateReview(review.id, { status: 'hidden', timestampColumn: 'hidden_at', reason }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/admin/reviews/:id/remove', auth, requireAdminPlans, async (req, res) => {
+  try {
+    const reason = req.body?.reason ? String(req.body.reason).trim().slice(0, 500) : null;
+    const { data: review, error: reviewError } = await supabase.from('plans_reviews').select('id, status').eq('id', req.params.id).maybeSingle();
+    if (reviewError) throw reviewError;
+    if (!review) return res.status(404).json({ error: 'Review not found' });
+    res.json(await moderateReview(review.id, { status: 'removed', timestampColumn: 'removed_at', reason }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
