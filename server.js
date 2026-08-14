@@ -1136,7 +1136,12 @@ app.post('/api/gym-members/invite-email', auth, async (req, res) => {
         gym_id,
         user_id: userId,
         status: 'active',
-        membership_type: plan_name || null,
+        // membership_type is NOT NULL; POST /api/gym-members/manual (the other
+        // owner-initiated add-member flow that doesn't collect a plan up
+        // front) already falls back to 'manual' here — match it instead of
+        // `|| null`, which violated the column's not-null constraint on every
+        // invite that didn't pass a plan_name.
+        membership_type: plan_name || 'manual',
         monthly_fee: 0,
         start_date: today,
         metadata: { full_name: trimmedName, email: trimmedEmail, is_email_invite: true },
@@ -1152,7 +1157,10 @@ app.post('/api/gym-members/invite-email', auth, async (req, res) => {
     res.status(201).json({ success: true, user_id: userId, membership_id: membership.id });
   } catch (err) {
     console.error('POST /api/gym-members/invite-email error:', err);
-    res.status(500).json({ message: err.message || 'Failed to send invite' });
+    // Never echo a raw DB error (constraint name, relation, etc.) to the
+    // client — mirrors the friendly message already used a few lines up for
+    // the inviteUserByEmail failure path in this same handler.
+    res.status(500).json({ message: 'Something went wrong sending that invite. Please try again.' });
   }
 });
 
