@@ -5445,21 +5445,20 @@ app.get('/api/users/lookup-user', auth, async (req, res) => {
       return res.status(400).json({ message: 'email query param is required' });
     }
 
-    // Use admin REST endpoint to find user by email
-    const adminRes = await fetch(
-      `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(email.trim())}`,
-      {
-        headers: {
-          apikey: process.env.SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-        },
-      }
-    );
-    const adminData = await adminRes.json();
-
-    const authUser = (adminData.users || []).find(
-      u => (u.email || '').toLowerCase() === email.trim().toLowerCase()
-    );
+    // GoTrue's admin/users ?email= query param is NOT an exact-match filter
+    // (a known-broken pattern in this codebase) — it silently returns the
+    // default first page regardless of the value passed, so any user
+    // outside that arbitrary ~50-user page was reported as not existing.
+    // Paginate through every user and match exactly, same pattern already
+    // used by listAllAuthUsers in routes/memberImportRoutes.js.
+    const trimmedEmail = email.trim().toLowerCase();
+    let authUser = null;
+    for (let page = 1; page <= 100 && !authUser; page++) {
+      const { data, error: listErr } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+      if (listErr) throw listErr;
+      authUser = (data?.users || []).find(u => (u.email || '').toLowerCase() === trimmedEmail);
+      if (!data?.users || data.users.length < 1000) break;
+    }
 
     if (!authUser) return res.status(404).json({ message: 'No user found with that email' });
 
