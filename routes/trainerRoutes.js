@@ -1086,6 +1086,38 @@ router.get('/gym-status', auth, async (req, res) => {
   }
 });
 
+// PATCH /api/trainer/leave-gym — trainer leaves their currently linked gym
+// (or withdraws a pending join request). Self-only: acts on the
+// authenticated user's own trainer_profiles row, mirrors PATCH
+// /api/trainer/unlink (client-leaves-trainer) and PATCH /api/my-gym/unlink
+// (member-leaves-gym) — same soft-detach shape, just for the trainer<->gym
+// affiliation. History (templates, past clients) is untouched.
+router.patch('/leave-gym', auth, async (req, res) => {
+  try {
+    const { data: tp, error: tpErr } = await supabase
+      .from('trainer_profiles')
+      .select('id, gym_id, pending_gym_id')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (tpErr) throw tpErr;
+    if (!tp) return res.status(404).json({ error: 'Trainer profile not found' });
+    if (!tp.gym_id && !tp.pending_gym_id) {
+      return res.status(404).json({ error: 'Not linked to a gym' });
+    }
+
+    const { error: updateErr } = await supabase
+      .from('trainer_profiles')
+      .update({ gym_id: null, pending_gym_id: null, updated_at: new Date().toISOString() })
+      .eq('id', tp.id);
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PATCH /api/trainer/leave-gym error:', err);
+    res.status(500).json({ error: err.message || 'Failed to leave gym' });
+  }
+});
+
 // POST /api/trainer/join-gym — trainer requests to join a gym by code
 router.post('/join-gym', auth, async (req, res) => {
   try {
