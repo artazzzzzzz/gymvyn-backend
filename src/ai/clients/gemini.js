@@ -12,7 +12,7 @@ function getClient() {
 
 async function callGeminiVision({ images, prompt, responseSchema }) {
   const model = getClient().getGenerativeModel({
-    model: 'gemini-2.5-flash-lite',
+    model: 'gemini-3.5-flash-lite',
     generationConfig: {
       responseMimeType: 'application/json',
       ...(responseSchema ? { responseSchema } : {}),

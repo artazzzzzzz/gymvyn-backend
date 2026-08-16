@@ -4699,7 +4699,7 @@ Use Indian food nutrition data. Common references:
 - 1 plate rajma chawal: ~400 cal, 15g protein, 65g carbs, 8g fat
 Be generous with common sense. If someone says 'lunch mein dal chawal khaya' assume 1 katori dal + 1 plate rice.`;
 
-    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-3.5-flash-lite' });
     const result = await model.generateContent([
       { text: systemPrompt },
       { text: `User said: "${transcript}"` },
@@ -4772,7 +4772,7 @@ If you can't identify the food clearly, set confidence to 'low'. Be reasonable w
     const mimeMatch = imageBase64.match(/^data:(image\/\w+);base64,/);
     const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
 
-    const model = getGenAI().getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = getGenAI().getGenerativeModel({ model: 'gemini-3.5-flash-lite' });
     const result = await model.generateContent([
       { text: prompt },
       { inlineData: { mimeType, data: cleanedB64 } },
