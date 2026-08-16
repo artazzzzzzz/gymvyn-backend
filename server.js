@@ -22,6 +22,8 @@ const {
 const {
   deactivateOtherGymMemberships,
   deactivateAllGymMemberships,
+  getActiveTrainerClientLink,
+  deactivateAllTrainerClientLinks,
 } = require('./src/utils/relationshipAuth');
 
 const app = express();
@@ -110,6 +112,13 @@ const membershipRenewSchema = z.object({
                  .max(1_000_000, 'amount exceeds maximum allowed value'),
   new_end_date: z.string().min(1, 'new_end_date is required'),
 });
+
+// Owner-editable membership fields only — no personal profile data
+// (name/phone/age/etc. belong to the member's own Settings screen).
+const membershipEditSchema = z.object({
+  membership_type: z.enum(['monthly', 'quarterly', 'half_yearly', 'annual']).optional(),
+  end_date:         z.string().min(1).optional(),
+}).strict('Unknown fields are not allowed');
 
 // .strict() blocks unknown keys — the PATCH handler spreads req.body directly
 // into the stored JSONB plan object, so unknown keys must be rejected.
@@ -1814,6 +1823,52 @@ app.delete('/api/gym-members/:memberId', auth, async (req, res) => {
   }
 });
 
+// ── PATCH /api/gym-members/:memberId — owner edits membership plan/type ──────
+// Deliberately narrow: only membership_type and end_date, the fields an
+// owner is allowed to manage. Personal profile data (name/phone/age/etc.)
+// stays exclusive to the member's own Settings screen.
+app.patch('/api/gym-members/:memberId', validate(membershipEditSchema), auth, async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    const { membership_type, end_date } = req.body;
+
+    if (!membership_type && !end_date) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    const { data: memRow, error: memLookupErr } = await supabase
+      .from('gym_memberships')
+      .select('id, gym_id')
+      .eq('user_id', memberId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (memLookupErr) throw memLookupErr;
+    if (!memRow) return res.status(404).json({ error: 'Member not found' });
+    if (!(await isGymOwner(req.user.id, memRow.gym_id))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const updatePayload = {};
+    if (membership_type) updatePayload.membership_type = membership_type;
+    if (end_date) updatePayload.end_date = end_date;
+
+    const { error } = await supabase
+      .from('gym_memberships')
+      .update(updatePayload)
+      .eq('id', memRow.id);
+    if (error) throw error;
+
+    const detail = await buildMemberDetail(memberId);
+    const { _gymId, ...member } = detail || {};
+    res.json({ success: true, member });
+  } catch (err) {
+    console.error('PATCH /api/gym-members/:memberId error:', err);
+    res.status(500).json({ error: err.message || 'Failed to update member' });
+  }
+});
+
 // ── Trainer management ────────────────────────────────────────────────────────
 
 app.post('/api/gym-trainers/invite', auth, async (req, res) => {
@@ -2158,6 +2213,26 @@ app.post('/api/gym-members/:memberId/assign-trainer', auth, async (req, res) => 
       .eq('user_id', memberId)
       .eq('status', 'active');
     if (error) throw error;
+
+    // Keep trainer_clients (the relationship TrainerDashboard/TrainerClients
+    // and this same endpoint's own client_count read from) in sync with
+    // gym_memberships.assigned_trainer_id — these are two separate stores
+    // for the same real-world relationship, and letting them diverge is
+    // exactly the "dashboard says 3, filter says 0" class of bug (see the
+    // Active-client-count mismatch elsewhere in this file).
+    await deactivateAllTrainerClientLinks(supabase, memberId);
+    if (trainer_id) {
+      const existingLink = await getActiveTrainerClientLink(supabase, trainer_id, memberId);
+      // deactivateAllTrainerClientLinks just flipped every link for this
+      // client (including one to this same trainer) to 'removed', so
+      // existingLink here will already be null — re-check is defensive only.
+      if (!existingLink) {
+        const { error: linkErr } = await supabase
+          .from('trainer_clients')
+          .insert({ trainer_id, client_id: memberId, status: 'active' });
+        if (linkErr) throw linkErr;
+      }
+    }
 
     res.json({ success: true });
   } catch (err) {
