@@ -20,6 +20,7 @@ const PERMISSION_KEYS = [
   'view_supplements',
   'view_announcements',
   'manage_feed',
+  'chat',
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
