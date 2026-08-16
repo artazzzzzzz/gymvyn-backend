@@ -46,6 +46,14 @@ async function deleteUserCascade(supabase, userId) {
     .or(`client_id.eq.${userId},trainer_id.eq.${userId}`);
   if (tcErr) throw tcErr;
 
+  // A trainer deleting their own account (Bug 8, trainer Delete Account)
+  // would otherwise leave an orphaned trainer_profiles row behind.
+  const { error: tpErr } = await supabase
+    .from('trainer_profiles')
+    .delete()
+    .eq('user_id', userId);
+  if (tpErr) throw tpErr;
+
   const { error: userErr } = await supabase.from('users').delete().eq('id', userId);
   if (userErr) throw userErr;
 
