@@ -236,6 +236,38 @@ app.get('/progress-photos/:userId', auth, async (req, res) => {
   }
 });
 
+// Delete a progress photo — caller must own the photo (self-only).
+// Cloudinary asset is left as an orphan; no other DELETE in this codebase
+// calls cloudinary.uploader.destroy, so we match that convention.
+app.delete('/api/progress-photos/:photoId', auth, async (req, res) => {
+  try {
+    const { photoId } = req.params;
+
+    // Fetch the row first so we can verify ownership before deleting.
+    const { data: photo, error: fetchErr } = await supabase
+      .from('progress_photos')
+      .select('id, user_id')
+      .eq('id', photoId)
+      .maybeSingle();
+
+    if (fetchErr) throw fetchErr;
+    if (!photo) return res.status(404).json({ message: 'Photo not found' });
+    if (photo.user_id !== req.user.id) return res.status(403).json({ message: 'Forbidden' });
+
+    const { error: deleteErr } = await supabase
+      .from('progress_photos')
+      .delete()
+      .eq('id', photoId);
+
+    if (deleteErr) throw deleteErr;
+
+    res.status(204).end();
+  } catch (err) {
+    console.error('Delete progress photo error:', err);
+    res.status(500).json({ message: err.message || 'Failed to delete photo' });
+  }
+});
+
 app.post('/chat', auth, async (req, res) => {
   try {
     const { message, history = [], userProfile = {} } = req.body;
