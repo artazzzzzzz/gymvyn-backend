@@ -2230,12 +2230,13 @@ app.get('/api/gym-trainers/:gymId', auth, async (req, res) => {
     }
 
     // Step 1: get active trainer_profiles for this gym
+    // phone_invited trainers have no user_id yet (haven't completed signup) but are
+    // included so the owner can see and copy their invite code.
     const { data: profiles, error: profilesErr } = await supabase
       .from('trainer_profiles')
       .select('*')
       .eq('gym_id', gymId)
-      .eq('is_active', true)
-      .neq('status', 'phone_invited');
+      .eq('is_active', true);
     if (profilesErr) throw profilesErr;
 
     if (!profiles || profiles.length === 0) {
