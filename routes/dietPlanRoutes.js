@@ -147,20 +147,32 @@ router.put('/templates/:id', auth, async (req, res) => {
     const invalidDay = hasInvalidDayTarget(days);
     if (invalidDay) return invalidTargetResponse(res, invalidDay);
 
-    // Verify ownership
+    // Verify ownership. NOTE: does not select/update a `version` column --
+    // diet_plan_templates has no such column live (confirmed via Postgres:
+    // "column diet_plan_templates.version does not exist"), and neither
+    // does the `diet_template_versions` table this route previously tried
+    // to insert into after saving. That version-tracking bolt-on was added
+    // in the same commit as the "additive lifecycle endpoints" below without
+    // ever shipping the migration that would create it, and directly
+    // contradicted this route's own header comment ("existing template
+    // GET/PUT/DELETE contracts are intentionally untouched") -- every save
+    // 404'd with "Not found" the moment the ownership-check select hit the
+    // missing column. Restored to the plain contract the comment promises;
+    // see POST /templates/:id/duplicate, PATCH /templates/:id/lifecycle,
+    // and GET /templates/:id/versions for the same still-unmigrated schema
+    // gap (out of scope here -- none of those are on the current QA list).
     const { data: existing, error: fetchErr } = await supabase
       .from('diet_plan_templates')
-      .select('id, trainer_id, version')
+      .select('id, trainer_id')
       .eq('id', req.params.id)
       .single();
     if (fetchErr || !existing || existing.trainer_id !== req.user.id) {
       return res.status(404).json({ error: 'Not found' });
     }
 
-    const nextVersion = (Number(existing.version) || 1) + 1;
     const { error: updateErr } = await supabase
       .from('diet_plan_templates')
-      .update({ name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, version: nextVersion, updated_at: new Date().toISOString() })
+      .update({ name, description, detail_level, calories_target, protein_g, carbs_g, fat_g, updated_at: new Date().toISOString() })
       .eq('id', req.params.id);
     if (updateErr) throw updateErr;
 
@@ -171,9 +183,6 @@ router.put('/templates/:id', auth, async (req, res) => {
     await insertTemplateDays(supabase, req.params.id, days);
 
     const full = await fetchFullTemplate(supabase, req.params.id);
-    await supabase.from('diet_template_versions').insert({
-      template_id: full.id, version: nextVersion, snapshot: full, created_by: req.user.id,
-    });
     res.json(full);
   } catch (err) {
     console.error('PUT /api/diet-plans/templates/:id error:', err);
