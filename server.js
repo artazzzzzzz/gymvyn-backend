@@ -1478,6 +1478,14 @@ app.get('/api/gym-members', auth, async (req, res) => {
     if (!isOwner) {
       const staffRow = await getActiveGymStaffRow(req.user.id, gymId);
       if (!staffRow) return res.status(403).json({ message: 'Forbidden' });
+      // Require view_members (or manage_members which implies it).
+      // checkin permission alone is NOT sufficient — checkin staff scan QR
+      // codes and do not need access to the full member list, payment history,
+      // or body metrics exposed by this endpoint.
+      const canViewMembers = await staffHasPermission(
+        staffRow.id, ['view_members', 'manage_members'],
+      );
+      if (!canViewMembers) return res.status(403).json({ message: 'Forbidden' });
     }
 
     const pageNum  = Math.max(1, parseInt(page,  10) || 1);
@@ -1824,8 +1832,13 @@ app.get('/api/gym-members/:memberId', auth, async (req, res) => {
     const detail = await buildMemberDetail(memberId);
     if (!detail) return res.status(404).json({ error: 'Member not found' });
     const isOwner = await isGymOwner(req.user.id, detail._gymId);
-    if (!isOwner && !(await getActiveGymStaffRow(req.user.id, detail._gymId))) {
-      return res.status(403).json({ error: 'Forbidden' });
+    if (!isOwner) {
+      const staffRow = await getActiveGymStaffRow(req.user.id, detail._gymId);
+      if (!staffRow) return res.status(403).json({ error: 'Forbidden' });
+      const canViewMembers = await staffHasPermission(
+        staffRow.id, ['view_members', 'manage_members'],
+      );
+      if (!canViewMembers) return res.status(403).json({ error: 'Forbidden' });
     }
     const { _gymId, ...member } = detail;   // strip internal field
     res.json(member);
