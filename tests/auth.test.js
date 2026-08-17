@@ -318,7 +318,7 @@ describe('Final defects — live validation boundaries', () => {
   });
 
   test('DEF-040 rejects a stored-active membership whose end_date has passed', async () => {
-    const lockers = await hitJson('GET', '/api/lockers', { token: tokens.owner });
+    const lockers = await hitJson('GET', `/api/lockers?gym_id=${GYM_ID}`, { token: tokens.owner });
     assert.equal(lockers.status, 200);
     const available = lockers.body.find(locker => locker.status === 'available');
     assert.ok(available?.id, 'an available seeded locker is required');
