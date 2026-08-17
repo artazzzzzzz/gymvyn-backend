@@ -1173,6 +1173,132 @@ app.post('/api/gym-members/invite-email', auth, async (req, res) => {
   }
 });
 
+// ── POST /api/gym-members/invite-phone  ──────────────────────────────────────
+// Bug 4 (QA re-verification): "Invite via Phone" in GymMembers.jsx used to be
+// a pure client-side sms: deep link — no DB write, so an owner who sent one
+// had zero record of it and no visibility. There is no phone-based magic-link
+// auth configured in this app (unlike invite-email, which rides Supabase's
+// inviteUserByEmail), so a Supabase-native "pending until claimed" flow isn't
+// available for phone the way it is for email. The SMS text itself already
+// tells the recipient to self-link via the gym's join code (same mechanism
+// as the QR/Code view) — there is no separate claim/accept step to build.
+// Given that, this mirrors POST /api/gym-members/manual (the existing
+// "profile-only member, no login yet" shape) instead of inventing a new
+// pending-invite table: it creates/reactivates a real, visible member row
+// immediately (tagged is_phone_invite in metadata) so the owner sees it in
+// the normal Members list right away, exactly like manual-add and
+// invite-email already do. No separate "pending invites" list exists for
+// ANY member-invite type in this codebase today (manual + email both create
+// active rows immediately too) — so there's nothing to add phone invites to.
+app.post('/api/gym-members/invite-phone', auth, async (req, res) => {
+  try {
+    const { gym_id, phone, full_name } = req.body || {};
+
+    if (!gym_id) return res.status(400).json({ message: 'gym_id is required' });
+    if (!(await isGymOwner(req.user.id, gym_id))) {
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+
+    const trimmedPhone = String(phone || '').trim();
+    if (!/^\d{10}$/.test(trimmedPhone)) {
+      return res.status(400).json({ message: 'phone must be 10 digits' });
+    }
+    const trimmedName = String(full_name || '').trim() || 'Invited Member';
+
+    // ── Check if an existing user (app account) has this phone ─────────────
+    let userId = null;
+
+    const { data: existingUser, error: lookupErr } = await supabase
+      .from('users')
+      .select('id')
+      .eq('phone', trimmedPhone)
+      .maybeSingle();
+    if (lookupErr) throw lookupErr;
+
+    if (existingUser) {
+      const { data: existingMem, error: memLookupErr } = await supabase
+        .from('gym_memberships')
+        .select('id, status')
+        .eq('gym_id', gym_id)
+        .eq('user_id', existingUser.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (memLookupErr) throw memLookupErr;
+
+      if (existingMem?.status === 'active') {
+        return res.status(409).json({ message: 'This phone number is already a member of your gym' });
+      }
+      if (existingMem) {
+        // Reactivate the existing (inactive) row instead of inserting a
+        // duplicate — same pattern as POST /api/gym-members/manual.
+        const { error: reactivateErr } = await supabase
+          .from('gym_memberships')
+          .update({
+            status: 'active',
+            start_date: new Date().toISOString().slice(0, 10),
+            end_date: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
+            updated_at: new Date().toISOString(),
+            metadata: { phone: trimmedPhone, is_phone_invite: true },
+          })
+          .eq('id', existingMem.id);
+        if (reactivateErr) throw reactivateErr;
+
+        await supabase.from('users').update({ gym_id, role: 'gym_member' }).eq('id', existingUser.id);
+
+        return res.status(201).json({ success: true, user_id: existingUser.id, membership_id: existingMem.id });
+      }
+      userId = existingUser.id;
+    }
+
+    // ── No app account found — create a profile-only user ─────────────────
+    if (!userId) {
+      userId = crypto.randomUUID();
+      const { error: userErr } = await supabase
+        .from('users')
+        .insert({
+          id: userId,
+          full_name: trimmedName,
+          phone: trimmedPhone,
+          role: 'gym_member',
+          gym_id,
+          is_active: true,
+        });
+      if (userErr) throw userErr;
+    }
+
+    // ── Insert gym_membership ────────────────────────────────────────────────
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: membership, error: memErr } = await supabase
+      .from('gym_memberships')
+      .insert({
+        id: crypto.randomUUID(),
+        gym_id,
+        user_id: userId,
+        status: 'active',
+        membership_type: 'manual',
+        monthly_fee: 0,
+        start_date: today,
+        metadata: { full_name: trimmedName, phone: trimmedPhone, is_phone_invite: true },
+      })
+      .select('id')
+      .single();
+
+    if (memErr) {
+      // Only roll back the user row if we just created it above.
+      if (userId && !existingUser) {
+        await supabase.from('users').delete().eq('id', userId);
+      }
+      throw memErr;
+    }
+
+    res.status(201).json({ success: true, user_id: userId, membership_id: membership.id });
+  } catch (err) {
+    console.error('POST /api/gym-members/invite-phone error:', err);
+    res.status(500).json({ message: 'Something went wrong sending that invite. Please try again.' });
+  }
+});
+
 // ── POST /api/gym-members/import  ────────────────────────────────────────────
 // Bulk import from CSV. Each member: { full_name, phone, email, plan_name }
 // Looks up existing users by phone or email; creates pending profiles otherwise.
