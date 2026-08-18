@@ -554,6 +554,7 @@ app.patch('/api/gyms/:gymId/settings', auth, requireGymOwner, async (req, res) =
     const ALLOWED = [
       'name', 'city', 'address', 'phone', 'description',
       'gym_type', 'operating_hours', 'membership_plans', 'notifications',
+      'logo_url', // null = remove logo; set by frontend Remove button
     ];
     const updateObj = {};
     ALLOWED.forEach(field => {
