@@ -5874,6 +5874,9 @@ app.use('/api/gym-feed', gymFeedRoutes);
 const gymReviewRoutes = require('./src/routes/gymReviewRoutes');
 app.use('/api/gym-reviews', gymReviewRoutes);
 
+const trainerReviewRoutes = require('./src/routes/trainerReviewRoutes');
+app.use('/api/trainer-reviews', trainerReviewRoutes);
+
 const reportsRoutes = require('./src/routes/reportsRoutes');
 app.use('/api/reports', reportsRoutes);
 
