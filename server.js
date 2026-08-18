@@ -5717,7 +5717,7 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
       .select('id, full_name, age, gender, goal, experience, equipment, injuries, training_days, current_weight, height, target_weight, activity_level, phone, share_achievements, role, gym_id, created_at')
       .eq('id', userId)
       .maybeSingle();
-      
+
     if (fetchErr) throw fetchErr;
     if (!updatedRow) return res.status(404).json({ message: 'User not found after update' });
     
@@ -5725,6 +5725,71 @@ app.patch('/api/users/:userId', auth, async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/users/:userId error:', err);
     res.status(500).json({ message: err.message || 'Failed to update user' });
+  }
+});
+
+// ── Notification preferences — separate endpoint so a pending migration
+// (notification_preferences column not yet added) never breaks the main user
+// GET/PATCH. If the column doesn't exist yet (Postgres error 42703) these
+// endpoints return defaults gracefully instead of 500ing.
+const NOTIF_DEFAULT = { chat: true, class_bookings: true, gym_announcements: true, trainer_plan: true };
+
+app.get('/api/users/:userId/notification-preferences', auth, async (req, res) => {
+  const { userId } = req.params;
+  if (req.user.id !== userId) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('notification_preferences')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) {
+      // 42703 = column does not exist (migration not yet applied) — return defaults
+      if (error.code === '42703') return res.json(NOTIF_DEFAULT);
+      throw error;
+    }
+    res.json(data?.notification_preferences ?? NOTIF_DEFAULT);
+  } catch (err) {
+    console.error('GET /api/users/:userId/notification-preferences error:', err);
+    res.status(500).json({ error: err.message || 'Failed to load preferences' });
+  }
+});
+
+app.patch('/api/users/:userId/notification-preferences', auth, async (req, res) => {
+  const { userId } = req.params;
+  if (req.user.id !== userId) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    // Accept only known keys; unknown keys are silently dropped
+    const prefs = {};
+    ['chat', 'class_bookings', 'gym_announcements', 'trainer_plan'].forEach(k => {
+      if (typeof req.body[k] === 'boolean') prefs[k] = req.body[k];
+    });
+    if (Object.keys(prefs).length === 0) {
+      return res.status(400).json({ error: 'No valid preference keys supplied' });
+    }
+    // Merge with existing prefs so partial updates don't clobber other keys
+    const { data: current, error: fetchErr } = await supabase
+      .from('users')
+      .select('notification_preferences')
+      .eq('id', userId)
+      .maybeSingle();
+    if (fetchErr) {
+      if (fetchErr.code === '42703') return res.json(NOTIF_DEFAULT); // migration pending
+      throw fetchErr;
+    }
+    const merged = { ...NOTIF_DEFAULT, ...(current?.notification_preferences ?? {}), ...prefs };
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update({ notification_preferences: merged })
+      .eq('id', userId);
+    if (updateErr) {
+      if (updateErr.code === '42703') return res.json(NOTIF_DEFAULT); // migration pending
+      throw updateErr;
+    }
+    res.json(merged);
+  } catch (err) {
+    console.error('PATCH /api/users/:userId/notification-preferences error:', err);
+    res.status(500).json({ error: err.message || 'Failed to save preferences' });
   }
 });
 
