@@ -803,11 +803,21 @@ router.post('/invite', auth, async (req, res) => {
     }
 
     if (!existing) {
+      // No prior relationship — create a new pending invite.
       const { error: insertErr } = await supabase
         .from('trainer_clients')
         .insert({ trainer_id: trainerId, client_id: foundUser.id, status: 'pending' });
       if (insertErr) throw insertErr;
+    } else if (existing.status !== 'pending') {
+      // Relationship exists but was previously removed/inactive — reset to pending
+      // so the member sees the invite again in their JoinTrainerSheet.
+      const { error: updateErr } = await supabase
+        .from('trainer_clients')
+        .update({ status: 'pending', started_at: null })
+        .eq('id', existing.id);
+      if (updateErr) throw updateErr;
     }
+    // If existing.status === 'pending', the invite is already there — no-op, idempotent.
 
     res.json({ success: true, client_name: foundUser.full_name });
   } catch (err) {
